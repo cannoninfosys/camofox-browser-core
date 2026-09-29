@@ -11,6 +11,21 @@ afterEach(() => {
 });
 
 describe('loadConfig', () => {
+  test('reads DISPLAY for the virtual display and forwards it to server subprocesses', () => {
+    process.env.DISPLAY = ':101';
+
+    const config = loadConfig();
+
+    expect(config.display).toBe(':101');
+    expect(config.serverEnv.DISPLAY).toBe(':101');
+  });
+
+  test('has no display when DISPLAY is unset', () => {
+    delete process.env.DISPLAY;
+
+    expect(loadConfig().display).toBeNull();
+  });
+
   test('reads the optional API bind host and forwards it to server subprocesses', () => {
     process.env.CAMOFOX_BIND_HOST = '127.0.0.1';
 

@@ -410,6 +410,10 @@ events.on('session:creating', ({ userId, contextOptions }) => {
 });
 ```
 
+### Virtual display
+
+On Linux (unless `CAMOFOX_INTERACTIVE=desktop`) the browser runs on an Xvfb display started by `lib/virtual-display.js`, not by Xvfb's own `-displayfd` pick (which can bind a display another X server holds without a lock file, such as Xwayland's `:0`). The display is `DISPLAY` (`:N`) when that one is free, otherwise the first display from `:500` with no listening X socket (path or abstract, from `/proc/net/unix`) and no lock file of a live process. On stop, leftover files are removed only for a display this server started. `ctx.VirtualDisplay` is this class; a plugin that provides the virtual display (`ctx.plugin.registerVirtualDisplayProvider`) should subclass it and override only `xvfb_args`.
+
 ### System Packages (`apt.txt`) and Post-Install Hooks
 
 Plugins that need system packages list them one per line in `apt.txt`:

@@ -391,6 +391,8 @@ export function register(app, ctx) {
 
 `browser:launching`, `session:creating`, `session:created`, and `session:destroyed` are emitted via `events.emitAsync()` -- the server awaits all listeners (including async ones) before proceeding. This ensures async work like loading storage state from disk completes before the context is created.
 
+`emitAsync()` runs listeners one after another, in the order they were added (plugin order, see `order` below), so a later plugin's change to the payload wins even when an earlier listener awaits before mutating. Every listener runs; if any throws, the first error is rethrown after the last one finishes.
+
 Other events use regular `events.emit()` (fire-and-forget).
 
 Modify payload objects in-place:
@@ -447,7 +449,25 @@ Both are run by `scripts/install-plugin-deps.sh` during Docker build.
 - **`plugins`** -- array of plugin directory names to load. Only these are loaded at startup and have deps installed during build.
 - If the file is missing or has no `plugins` key, **all** plugins in `plugins/` are loaded (backward-compatible).
 - This is camofox's own config. `openclaw.plugin.json` is separate -- it tells the OpenClaw Gateway how to configure camofox as an external service.
-- `CAMOFOX_CONFIG=/path/to/camofox.config.json` reads the config from another file (runtime only; the Docker build and `scripts/plugin.js` still use the install folder's file). The default is unchanged.
+- `CAMOFOX_CONFIG=/path/to/camofox.config.json` reads the config from another file (runtime only; the Docker build and `scripts/plugin.js` still use the install folder's file). The default is unchanged. A `CAMOFOX_CONFIG` file that does not exist, or any config file that is not valid JSON, stops startup (`plugin_config_invalid`).
+
+#### Required plugins and plugin order
+
+In the object format, a plugin entry can also set:
+
+```json
+{
+  "plugins": {
+    "persistence": { "enabled": true },
+    "my-guard": { "enabled": true, "required": true, "order": 100 }
+  }
+}
+```
+
+- **`required: true`** -- the plugin must load. If it is missing, has no `index.js`, is disabled, does not export `register`, or throws while importing or in `register`, startup stops with a `plugin_required_failed` error naming the plugin (the server logs `plugin startup failed` and exits with code 78, `EX_CONFIG`). Missing required plugins are detected before any plugin registers. Without `required` (the default), a failing plugin is logged and skipped as before.
+- **`order: <number>`** -- registration order, default `0`, lower first; plugins with the same order keep folder order (built-in `plugins/`, then `CAMOFOX_PLUGIN_PATH` folders, each alphabetically). Listeners a plugin adds during `register` therefore run in plugin order, so a plugin with a higher order has the final say on mutating hooks such as `session:creating`. Listeners added later (e.g. inside another event) or with `prependListener` are outside this ordering.
+- Both must have the right type (`required` a boolean, `order` a finite number) or startup stops with `plugin_config_invalid`. The array format and plugins enabled only through their `enableEnvVar` have neither option (order `0`, not required).
+- Any plugin startup error (`plugin_required_failed`, `plugin_config_invalid`, `plugin_name_conflict`, `plugin_path_invalid`) exits with code 78; a supervisor can use it to stop restarting (systemd: `RestartPreventExitStatus=78`).
 
 ### External plugin folders (`CAMOFOX_PLUGIN_PATH`)
 
@@ -461,7 +481,7 @@ npm start
 ```
 
 - `CAMOFOX_PLUGIN_PATH` lists folders of plugins, separated like `PATH` (`:`; `;` on Windows). Each subfolder with an `index.js` is a plugin named after the subfolder; symlinked subfolders are followed.
-- Built-in `plugins/` are registered first, then each external folder in order.
+- Built-in `plugins/` are registered first, then each external folder in order (unless `order` says otherwise, see above).
 - Plugin names are unique: a name found in more than one folder (built-in or external, enabled or not) stops startup with a `plugin_name_conflict` error. A listed folder that does not exist stops startup with `plugin_path_invalid`.
 - The `camofox.config.json` `plugins` list applies to external plugins too: when the file has a list, add the external plugin's name to it (or point `CAMOFOX_CONFIG` at a config that does).
 - External plugins get everything through `ctx`; do not import core modules by relative path (`../../lib/...`), since imports resolve from the plugin's real location and its own `node_modules`.

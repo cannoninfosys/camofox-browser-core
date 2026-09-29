@@ -7121,7 +7121,22 @@ const pluginCtx = {
   /** The upstream VirtualDisplay class -- plugins can subclass it. */
   VirtualDisplay,
 };
-const loadedPlugins = await loadPlugins(app, pluginCtx);
+// A plugin error that must stop startup (a required plugin failed, invalid plugin
+// config, name clash) exits with EX_CONFIG (78) -- a configuration problem, not a
+// crash, so it is not reported as one and a supervisor can choose not to restart.
+let loadedPlugins;
+try {
+  loadedPlugins = await loadPlugins(app, pluginCtx);
+} catch (err) {
+  log('error', 'plugin startup failed', {
+    code: err?.code,
+    plugin: err?.plugin,
+    error: err?.message,
+    cause: err?.cause?.message,
+    stack: (err?.cause || err)?.stack,
+  });
+  process.exit(78);
+}
 
 // --- OpenAPI docs (after all routes are registered) ---
 mountDocs(app);

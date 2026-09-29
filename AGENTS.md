@@ -257,7 +257,7 @@ When adding features that need env vars or subprocesses, put that code in a `lib
 
 ## Plugin System
 
-Plugins extend camofox-browser with new endpoints, background processes, and lifecycle hooks. The server auto-loads all plugins from `plugins/<name>/index.js` on startup.
+Plugins extend camofox-browser with new endpoints, background processes, and lifecycle hooks. The server auto-loads all plugins from `plugins/<name>/index.js` on startup, then from each folder listed in `CAMOFOX_PLUGIN_PATH` (see "External plugin folders").
 
 ### Creating a Plugin
 
@@ -447,6 +447,24 @@ Both are run by `scripts/install-plugin-deps.sh` during Docker build.
 - **`plugins`** -- array of plugin directory names to load. Only these are loaded at startup and have deps installed during build.
 - If the file is missing or has no `plugins` key, **all** plugins in `plugins/` are loaded (backward-compatible).
 - This is camofox's own config. `openclaw.plugin.json` is separate -- it tells the OpenClaw Gateway how to configure camofox as an external service.
+- `CAMOFOX_CONFIG=/path/to/camofox.config.json` reads the config from another file (runtime only; the Docker build and `scripts/plugin.js` still use the install folder's file). The default is unchanged.
+
+### External plugin folders (`CAMOFOX_PLUGIN_PATH`)
+
+A plugin can live outside the install folder, for example in its own git checkout:
+
+```bash
+# /opt/camofox-plugins/my-plugin/index.js  (a folder or a symlink to a checkout)
+CAMOFOX_PLUGIN_PATH=/opt/camofox-plugins \
+CAMOFOX_CONFIG=/etc/camofox/camofox.config.json \
+npm start
+```
+
+- `CAMOFOX_PLUGIN_PATH` lists folders of plugins, separated like `PATH` (`:`; `;` on Windows). Each subfolder with an `index.js` is a plugin named after the subfolder; symlinked subfolders are followed.
+- Built-in `plugins/` are registered first, then each external folder in order.
+- Plugin names are unique: a name found in more than one folder (built-in or external, enabled or not) stops startup with a `plugin_name_conflict` error. A listed folder that does not exist stops startup with `plugin_path_invalid`.
+- The `camofox.config.json` `plugins` list applies to external plugins too: when the file has a list, add the external plugin's name to it (or point `CAMOFOX_CONFIG` at a config that does).
+- External plugins get everything through `ctx`; do not import core modules by relative path (`../../lib/...`), since imports resolve from the plugin's real location and its own `node_modules`.
 
 ### Installing Plugins
 

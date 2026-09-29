@@ -1,8 +1,8 @@
 /**
  * Tests for lib/plugins.js -- createPluginEvents, loadPlugins, and config reading.
  */
-import { describe, test, expect, jest } from '@jest/globals';
-import { createPluginEvents, loadPlugins } from '../../lib/plugins.js';
+import { describe, test, expect, jest, beforeEach, afterEach } from '@jest/globals';
+import { createPluginEvents, discoverPlugins, loadPlugins } from '../../lib/plugins.js';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -258,6 +258,152 @@ describe('lib/plugins', () => {
         const indexPath = path.join(rootDir, 'plugins', name, 'index.js');
         expect(fs.existsSync(indexPath)).toBe(true);
       }
+    });
+  });
+  describe('external plugin folders (CAMOFOX_PLUGIN_PATH)', () => {
+    const __dirname = path.dirname(fileURLToPath(import.meta.url));
+    const FIXTURE_PLUGINS = path.join(__dirname, '../fixtures/external-plugins');
+    const BUILTIN_PLUGINS = path.join(__dirname, '../../plugins');
+    let tmpDir;
+
+    beforeEach(() => {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'camofox-plugin-path-test-'));
+    });
+
+    afterEach(() => {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    function makeCtx(config = {}) {
+      return { log: jest.fn(), events: createPluginEvents(), sessions: new Map(), config };
+    }
+
+    function makePluginDir(root, name, { index = true } = {}) {
+      const dir = path.join(root, name);
+      fs.mkdirSync(dir, { recursive: true });
+      if (index) fs.writeFileSync(path.join(dir, 'index.js'), 'export function register() {}\n');
+      return dir;
+    }
+
+    function writeConfig(plugins) {
+      const configPath = path.join(tmpDir, 'camofox.config.json');
+      fs.writeFileSync(configPath, JSON.stringify({ plugins }));
+      return configPath;
+    }
+
+    test('scans the built-in folder first, then each extra folder in order', () => {
+      const builtin = path.join(tmpDir, 'builtin');
+      const first = path.join(tmpDir, 'first');
+      const second = path.join(tmpDir, 'second');
+      makePluginDir(builtin, 'alpha');
+      makePluginDir(builtin, 'beta');
+      makePluginDir(second, 'aardvark');
+      makePluginDir(first, 'zulu');
+
+      const found = discoverPlugins({ pluginsDir: builtin, pluginPaths: [first, second] });
+
+      expect(found.map((p) => p.name)).toEqual(['alpha', 'beta', 'zulu', 'aardvark']);
+      expect(found.map((p) => p.pluginsDir)).toEqual([builtin, builtin, first, second]);
+      expect(found[2].dir).toBe(path.join(first, 'zulu'));
+    });
+
+    test('finds a plugin folder that is a symlink and skips a broken link', () => {
+      const extra = path.join(tmpDir, 'extra');
+      fs.mkdirSync(extra);
+      const checkout = makePluginDir(path.join(tmpDir, 'checkouts'), 'linked-checkout');
+      fs.symlinkSync(checkout, path.join(extra, 'linked'), 'dir');
+      fs.symlinkSync(path.join(tmpDir, 'missing'), path.join(extra, 'dangling'), 'dir');
+      const ctx = makeCtx();
+
+      const found = discoverPlugins({ pluginsDir: path.join(tmpDir, 'none'), pluginPaths: [extra] }, ctx);
+
+      expect(found).toEqual([{ name: 'linked', dir: path.join(extra, 'linked'), pluginsDir: extra, hasIndex: true }]);
+      expect(ctx.log).toHaveBeenCalledWith('warn', 'plugin link is broken, skipping', expect.objectContaining({ plugin: 'dangling' }));
+    });
+
+    test('a name clash with a built-in plugin is a startup error, even if the built-in is disabled', async () => {
+      const extra = path.join(tmpDir, 'extra');
+      makePluginDir(extra, 'vnc');
+      const configPath = writeConfig({ vnc: { enabled: false }, youtube: { enabled: true } });
+      const app = { loaded: [] };
+
+      await expect(loadPlugins(app, makeCtx(), { pluginsDir: BUILTIN_PLUGINS, pluginPaths: [extra], configPath }))
+        .rejects.toMatchObject({ code: 'plugin_name_conflict', message: expect.stringContaining('"vnc"') });
+      expect(app.loaded).toEqual([]);
+    });
+
+    test('a name clash between two extra folders is a startup error naming both folders', () => {
+      const first = path.join(tmpDir, 'first');
+      const second = path.join(tmpDir, 'second');
+      makePluginDir(first, 'shared');
+      makePluginDir(second, 'shared');
+
+      let error = null;
+      try {
+        discoverPlugins({ pluginsDir: path.join(tmpDir, 'none'), pluginPaths: [first, second] });
+      } catch (err) {
+        error = err;
+      }
+
+      expect(error?.code).toBe('plugin_name_conflict');
+      expect(error.message).toContain(first);
+      expect(error.message).toContain(second);
+    });
+
+    test('a folder without index.js does not clash', () => {
+      const first = path.join(tmpDir, 'first');
+      const second = path.join(tmpDir, 'second');
+      makePluginDir(first, 'shared', { index: false });
+      makePluginDir(second, 'shared');
+
+      const found = discoverPlugins({ pluginsDir: path.join(tmpDir, 'none'), pluginPaths: [first, second] });
+
+      expect(found).toEqual([{ name: 'shared', dir: path.join(second, 'shared'), pluginsDir: second, hasIndex: true }]);
+    });
+
+    test('a missing extra folder is a startup error', () => {
+      const missing = path.join(tmpDir, 'does-not-exist');
+
+      expect(() => discoverPlugins({ pluginsDir: path.join(tmpDir, 'none'), pluginPaths: [missing] }))
+        .toThrow(expect.objectContaining({ code: 'plugin_path_invalid' }));
+    });
+
+    test('loads an external plugin from ctx.config.pluginPaths using ctx.config.configPath', async () => {
+      const configPath = writeConfig({ 'external-fixture': { enabled: true, answer: 42 } });
+      const ctx = makeCtx({ pluginPaths: [FIXTURE_PLUGINS], configPath });
+      const app = { loaded: [] };
+
+      const loaded = await loadPlugins(app, ctx, { pluginsDir: path.join(tmpDir, 'no-builtins') });
+
+      expect(loaded).toEqual(['external-fixture']);
+      expect(app.loaded).toEqual([{ name: 'external-fixture', settings: { enabled: true, answer: 42 } }]);
+      expect(ctx.log).toHaveBeenCalledWith('info', 'plugin loaded', {
+        plugin: 'external-fixture',
+        dir: path.join(FIXTURE_PLUGINS, 'external-fixture'),
+      });
+    });
+
+    test('the camofox.config.json allow-list also applies to external plugins', async () => {
+      const configPath = writeConfig({ youtube: { enabled: true } });
+      const ctx = makeCtx({ pluginPaths: [FIXTURE_PLUGINS], configPath });
+      const app = { loaded: [] };
+
+      const loaded = await loadPlugins(app, ctx, { pluginsDir: path.join(tmpDir, 'no-builtins') });
+
+      expect(loaded).toEqual([]);
+      expect(app.loaded).toEqual([]);
+      expect(ctx.log).toHaveBeenCalledWith('debug', 'plugin "external-fixture" not in camofox.config.json plugins list, skipping');
+    });
+
+    test('without extra folders only the built-in plugins are found (default unchanged)', () => {
+      const builtinNames = fs.readdirSync(BUILTIN_PLUGINS, { withFileTypes: true })
+        .filter((e) => e.isDirectory() && !e.name.startsWith('_') && !e.name.startsWith('.'))
+        .map((e) => e.name);
+
+      const found = discoverPlugins();
+
+      expect(found.map((p) => p.name)).toEqual(builtinNames);
+      expect(found.every((p) => p.pluginsDir === BUILTIN_PLUGINS)).toBe(true);
     });
   });
 });

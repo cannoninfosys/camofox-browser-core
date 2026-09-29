@@ -2,7 +2,7 @@ import { describe, expect, test, afterEach } from '@jest/globals';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { loadConfig } from '../../lib/config.js';
+import { loadConfig, camofoxConfigPath, parsePluginPaths } from '../../lib/config.js';
 
 const ORIGINAL_ENV = { ...process.env };
 
@@ -143,6 +143,68 @@ describe('loadConfig', () => {
     expect(loadConfig({ configPath }).newPageTimeoutMs).toBe(10000);
 
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('reads camofox.config.json from CAMOFOX_CONFIG and forwards it to server subprocesses', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'camofox-config-'));
+    const configPath = path.join(dir, 'custom.config.json');
+    fs.writeFileSync(configPath, JSON.stringify({ newPageTimeoutMs: 15000, interactive: { mode: 'desktop' } }));
+    process.env.CAMOFOX_CONFIG = configPath;
+
+    const config = loadConfig();
+
+    expect(config.configPath).toBe(configPath);
+    expect(config.newPageTimeoutMs).toBe(15000);
+    expect(config.interactiveMode).toBe('desktop');
+    expect(config.serverEnv.CAMOFOX_CONFIG).toBe(configPath);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('an explicit configPath option takes precedence over CAMOFOX_CONFIG', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'camofox-config-'));
+    const envPath = path.join(dir, 'env.json');
+    const explicitPath = path.join(dir, 'explicit.json');
+    fs.writeFileSync(envPath, JSON.stringify({ newPageTimeoutMs: 15000 }));
+    fs.writeFileSync(explicitPath, JSON.stringify({ newPageTimeoutMs: 20000 }));
+    process.env.CAMOFOX_CONFIG = envPath;
+
+    const config = loadConfig({ configPath: explicitPath });
+
+    expect(config.configPath).toBe(explicitPath);
+    expect(config.newPageTimeoutMs).toBe(20000);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('resolves a relative CAMOFOX_CONFIG against the working directory', () => {
+    process.env.CAMOFOX_CONFIG = 'relative/camofox.config.json';
+
+    expect(camofoxConfigPath()).toBe(path.resolve('relative/camofox.config.json'));
+  });
+
+  test('parses CAMOFOX_PLUGIN_PATH into absolute folders and forwards it to server subprocesses', () => {
+    const value = ['/opt/camofox-plugins', '', ' relative/plugins ', '/srv/more-plugins'].join(path.delimiter);
+    process.env.CAMOFOX_PLUGIN_PATH = value;
+
+    const config = loadConfig();
+
+    expect(config.pluginPaths).toEqual([
+      path.resolve('/opt/camofox-plugins'),
+      path.resolve('relative/plugins'),
+      path.resolve('/srv/more-plugins'),
+    ]);
+    expect(config.serverEnv.CAMOFOX_PLUGIN_PATH).toBe(value);
+  });
+
+  test('keeps the default config path and no extra plugin folders when neither variable is set', () => {
+    delete process.env.CAMOFOX_CONFIG;
+    delete process.env.CAMOFOX_PLUGIN_PATH;
+    const repoConfig = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../camofox.config.json');
+
+    const config = loadConfig();
+
+    expect(config.configPath).toBe(repoConfig);
+    expect(config.pluginPaths).toEqual([]);
+    expect(parsePluginPaths(undefined)).toEqual([]);
   });
 
   test('enables desktop interactive mode from the environment and forwards it to server subprocesses', () => {

@@ -654,6 +654,8 @@ Browser behavior can be tuned in `camofox.config.json`:
 | `MAX_TABS_PER_SESSION` | Max tabs per session | `10` |
 | `SESSION_TIMEOUT_MS` | Session inactivity timeout (0 = never) | `600000` (10min) |
 | `BROWSER_IDLE_TIMEOUT_MS` | Kill browser when idle (0 = never) | `300000` (5min) |
+| `CAMOFOX_CONFIG` | Path to `camofox.config.json` (plugin list and settings) | the install folder's `camofox.config.json` |
+| `CAMOFOX_PLUGIN_PATH` | Extra plugin folders, separated like `PATH` (`:`; `;` on Windows), loaded after the built-in `plugins/`. A plugin name that exists in more than one folder stops startup with an error | - |
 | `CAMOFOX_INTERACTIVE` | Interactive browser mode: `desktop` opens a real local Camoufox window; `off` keeps normal headless behavior | `off` |
 | `HANDLER_TIMEOUT_MS` | Max time for any handler | `30000` (30s) |
 | `MAX_CONCURRENT_PER_USER` | Concurrent request cap per user | `3` |

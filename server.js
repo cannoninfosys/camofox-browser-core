@@ -47,6 +47,7 @@ import { selectOption } from './lib/select-option.js';
 import { visibleSelectorCandidate } from './lib/visible-selector.js';
 import { normalizeBrowserKey } from './lib/browser-key.js';
 import { createPageWithSessionRecovery } from './lib/new-page-recovery.js';
+import { createNavigationBlocks, isNavigationBlockedError, toNavigationRefusal } from './lib/navigation-block.js';
 import { resolveUploadPaths } from './lib/upload-paths.js';
 import { acquirePageLease, hasActivePageLeases, isPageLeased, releasePageLease, setLeasedPage } from './lib/page-lease.js';
 import { createReporter, createTabHealthTracker, collectResourceSnapshot, classifyProxyError, browserProcessTreeRssMb, browserProcessNameRssMb } from './lib/reporter.js';
@@ -302,6 +303,7 @@ function sendError(res, err, extraFields = {}) {
   if (code) body.code = code;
   if (recovery) body.recovery = recovery;
   if (err instanceof StaleRefsError) body.ref = err.ref;
+  if (isNavigationBlockedError(err)) body.blocked = err.blocked;
   if (status >= 500 && !err.statusCode && !recovery) {
     const req = res.req;
     const userId = req?.query?.userId || req?.body?.userId;
@@ -1485,7 +1487,7 @@ function getTabGroup(session, listItemId) {
 // Centralized error handler for route catch blocks.
 // Auto-destroys dead browser sessions and returns appropriate status codes.
 function isProxyError(err) {
-  if (!err) return false;
+  if (!err || isNavigationBlockedError(err)) return false;
   const msg = err.message || '';
   return msg.includes('NS_ERROR_PROXY') || msg.includes('proxy connection') || msg.includes('Proxy connection') ||
     msg.includes('NS_ERROR_CONNECTION_REFUSED') || msg.includes('NS_ERROR_NET_RESET') ||
@@ -1526,6 +1528,8 @@ function handleRouteError(err, req, res, extraFields = {}) {
   if (tabId) {
     pluginEvents.emit('tab:error', { userId, tabId, error: err, ...sentryContext });
   }
+  // A plugin blocked the navigation: an answer, not a browser failure (nothing to recover or rotate).
+  if (isNavigationBlockedError(err)) return sendError(res, err, extraFields);
   if (isPageCrashedError(err)) {
     if (foundForContext) destroyTab(sessions.get(normalizeUserId(userId)), tabId, 'page_crashed', userId);
     return res.status(410).json({ error: 'Page crashed. Open a new tab.', code: 'page_crashed', retryable: true, recovery: 'create_new_tab', ...extraFields });
@@ -2034,7 +2038,7 @@ async function rotateGoogleTab(userId, sessionKey, tabId, previousTabState, reas
   await withPageLoadDuration('navigate', () => navigatePage(page, 'https://www.google.com/', { timeout: NAVIGATE_TIMEOUT_MS }));
   tabState.visitedUrls.add('https://www.google.com/');
   await page.waitForTimeout(1200);
-  await withPageLoadDuration('navigate', () => navigatePage(page, tabState.lastRequestedUrl, { timeout: NAVIGATE_TIMEOUT_MS }));
+  await withPageLoadDuration('navigate', () => navigatePage(page, tabState.lastRequestedUrl, { timeout: NAVIGATE_TIMEOUT_MS, userId, tabId }));
   tabState.visitedUrls.add(tabState.lastRequestedUrl);
   return { session, tabState };
 }
@@ -2060,8 +2064,23 @@ async function withPageLoadDuration(action, fn) {
   }
 }
 
-async function navigatePage(page, url, { timeout = 30000 } = {}) {
+// Plugin routes answer blocked navigations through ctx.fulfillBlockedNavigation (lib/navigation-block.js).
+const navigationBlocks = createNavigationBlocks();
+
+// Every API navigation (userId given) first awaits the `tab:navigating` hook: a plugin may prepare for it or
+// refuse it (a structured error becomes a NavigationBlockedError; any other listener error fails the navigation).
+async function emitNavigating({ userId, tabId, url, page }) {
+  try {
+    await pluginEvents.emitAsync('tab:navigating', { userId: normalizeUserId(userId), tabId: tabId || null, url, source: 'api', page });
+  } catch (err) {
+    throw toNavigationRefusal(err);
+  }
+}
+
+async function navigatePage(page, url, { timeout = 30000, userId = null, tabId = null } = {}) {
+  if (userId) await emitNavigating({ userId, tabId, url, page });
   const response = await page.goto(url, { waitUntil: 'commit', timeout });
+  navigationBlocks.check(response); // a plugin route answered it as a block: the page shows its answer
   const contentType = response?.headers()?.['content-type']?.toLowerCase() || '';
   if (!contentType.startsWith('image/')) {
     await page.waitForLoadState('domcontentloaded', { timeout });
@@ -2963,7 +2982,7 @@ app.post('/tabs', async (req, res) => {
         if (urlErr) throw Object.assign(new Error(urlErr), { statusCode: 400 });
         tabState.lastRequestedUrl = url;
         try {
-          const navigationResponse = await withPageLoadDuration('open_url', () => navigatePage(page, url));
+          const navigationResponse = await withPageLoadDuration('open_url', () => navigatePage(page, url, { userId, tabId }));
           tabState.lastNavigationHttpStatus = typeof navigationResponse?.status === 'function' ? navigationResponse.status() : null;
           recordNavSuccess(userId);
         } catch (navErr) {
@@ -2987,12 +3006,19 @@ app.post('/tabs', async (req, res) => {
             releasePageLease(session, retryLease);
             attachPopupHandler(retryPage, userId, resolvedSessionKey);
             refreshActiveTabsGauge();
-            const navigationResponse = await withPageLoadDuration('open_url', () => navigatePage(retryPage, url));
+            const navigationResponse = await withPageLoadDuration('open_url', () => navigatePage(retryPage, url, { userId, tabId }));
             tabState.lastNavigationHttpStatus = typeof navigationResponse?.status === 'function' ? navigationResponse.status() : null;
             recordNavSuccess(userId);
           } else {
-            if (recordNavFailure(userId)) {
+            // A plugin's block is an answer, not a browser failure: never counted toward session recovery.
+            if (!isNavigationBlockedError(navErr) && recordNavFailure(userId)) {
               await recoverUserSession(userId, 'tab_create_nav_failure');
+            }
+            if (isNavigationBlockedError(navErr) && navErr.phase === 'before') {
+              // Refused before anything was navigated: do not leave the blank tab behind.
+              group.delete(tabId);
+              await safePageClose(page);
+              refreshActiveTabsGauge();
             }
             throw navErr;
           }
@@ -3014,7 +3040,7 @@ app.post('/tabs', async (req, res) => {
   } catch (err) {
     log('error', 'tab create failed', { reqId: req.reqId, error: err.message });
     // SSL certificate errors on initial navigation — non-retriable
-    const isSslError = err.message && (
+    const isSslError = !isNavigationBlockedError(err) && err.message && (
       err.message.includes('SEC_ERROR') ||
       err.message.includes('SSL_ERROR') ||
       err.message.includes('MOZILLA_PKIX_ERROR')
@@ -3144,7 +3170,9 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
         const navigateAmazonSearch = async () => {
           const amazonHomeUrl = 'https://www.amazon.com/';
           tabState.lastRequestedUrl = targetUrl;
+          await emitNavigating({ userId, tabId, url: amazonHomeUrl, page: tabState.page });
           const homeResponse = await withPageLoadDuration('navigate', () => tabState.page.goto(amazonHomeUrl, { waitUntil: 'domcontentloaded', timeout: NAVIGATE_TIMEOUT_MS }));
+          navigationBlocks.check(homeResponse);
           if (homeResponse && homeResponse.status() >= 500) {
             tabState.lastSnapshot = null;
             throw Object.assign(
@@ -3205,7 +3233,7 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
           if (isAmazonSearch) return navigateAmazonSearch();
           tabState.lastRequestedUrl = targetUrl;
           const ac = tabState.navigateAbort = new AbortController();
-          const gotoP = withPageLoadDuration('navigate', () => navigatePage(tabState.page, targetUrl, { timeout: NAVIGATE_TIMEOUT_MS }));
+          const gotoP = withPageLoadDuration('navigate', () => navigatePage(tabState.page, targetUrl, { timeout: NAVIGATE_TIMEOUT_MS, userId, tabId }));
           try {
             const response = await Promise.race([
               gotoP,
@@ -3376,7 +3404,7 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
             // The Google request failed upstream; a successful fallback is the
             // existing search behavior and is the only success reported here.
           } else {
-            if (recordNavFailure(userId)) {
+            if (!isNavigationBlockedError(navErr) && recordNavFailure(userId)) {
               await recoverUserSession(userId, 'navigate_failure');
             }
             throw navErr;
@@ -3457,12 +3485,12 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
     res.json(result);
   } catch (err) {
     log('error', 'navigate failed', { reqId: req.reqId, tabId, error: err.message });
-    const is400 = err.message && (err.message.startsWith('Blocked URL scheme') || err.message === 'url or macro required');
+    const is400 = !isNavigationBlockedError(err) && err.message && (err.message.startsWith('Blocked URL scheme') || err.message === 'url or macro required');
     if (is400) {
       return res.status(400).json({ error: safeError(err) });
     }
     // SSL certificate errors — site has a bad/self-signed cert. Non-retriable.
-    const isSslError = err.message && (
+    const isSslError = !isNavigationBlockedError(err) && err.message && (
       err.message.includes('SEC_ERROR') ||
       err.message.includes('SSL_ERROR') ||
       err.message.includes('MOZILLA_PKIX_ERROR')
@@ -6360,7 +6388,7 @@ app.post('/tabs/open', async (req, res) => {
     refreshActiveTabsGauge();
     
     try {
-      await withPageLoadDuration('open_url', () => navigatePage(page, url));
+      await withPageLoadDuration('open_url', () => navigatePage(page, url, { userId, tabId }));
       recordNavSuccess(userId);
     } catch (navErr) {
       if ((isProxyError(navErr) || isTimeoutError(navErr)) && proxyPool?.canRotateSessions) {
@@ -6382,11 +6410,16 @@ app.post('/tabs/open', async (req, res) => {
         releasePageLease(session, lease);
         attachPopupHandler(page, userId, listItemId);
         refreshActiveTabsGauge();
-        await withPageLoadDuration('open_url', () => navigatePage(page, url));
+        await withPageLoadDuration('open_url', () => navigatePage(page, url, { userId, tabId }));
         recordNavSuccess(userId);
       } else {
-        if (recordNavFailure(userId)) {
+        if (!isNavigationBlockedError(navErr) && recordNavFailure(userId)) {
           await recoverUserSession(userId, 'tab_open_nav_failure');
+        }
+        if (isNavigationBlockedError(navErr) && navErr.phase === 'before') {
+          group.delete(tabId);
+          await safePageClose(page);
+          refreshActiveTabsGauge();
         }
         throw navErr;
       }
@@ -6555,7 +6588,7 @@ app.post('/navigate', async (req, res) => {
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
     
     const result = await withTabLock(targetId, async () => {
-      await withPageLoadDuration('navigate', () => navigatePage(tabState.page, url));
+      await withPageLoadDuration('navigate', () => navigatePage(tabState.page, url, { userId, tabId: targetId }));
       recordNavSuccess(userId);
       tabState.visitedUrls.add(url);
       tabState.lastSnapshot = null;
@@ -6573,7 +6606,7 @@ app.post('/navigate', async (req, res) => {
     res.json(result);
   } catch (err) {
     log('error', 'openclaw navigate failed', { reqId: req.reqId, error: err.message });
-    if (recordNavFailure(req.body?.userId)) {
+    if (!isNavigationBlockedError(err) && recordNavFailure(req.body?.userId)) {
       await recoverUserSession(req.body.userId, 'openclaw_navigate_failure');
     }
     handleRouteError(err, req, res);
@@ -7118,6 +7151,8 @@ const pluginCtx = {
   registerVirtualDisplayProvider: (pluginName, factory) => virtualDisplayRegistry.register(pluginName, factory),
   /** The VirtualDisplay class (camoufox-js, with safe display selection) -- plugins can subclass it. */
   VirtualDisplay: SafeVirtualDisplay,
+  /** Answer a route as a blocked navigation (lib/navigation-block.js); the API caller gets the block. */
+  fulfillBlockedNavigation: navigationBlocks.fulfill,
 };
 // A plugin error that must stop startup (a required plugin failed, invalid plugin
 // config, name clash) exits with EX_CONFIG (78) -- a configuration problem, not a

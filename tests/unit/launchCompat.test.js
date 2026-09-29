@@ -25,7 +25,7 @@ describe('launch compatibility source contract', () => {
     );
     const pluginContext = sourceBetween(
       'const pluginCtx = {',
-      'const loadedPlugins = await loadPlugins'
+      'loadedPlugins = await loadPlugins'
     );
 
     expect(defaultVirtualDisplay).toContain("DEFAULT_VIRTUAL_DISPLAY_RESOLUTION = '1280x720x24'");

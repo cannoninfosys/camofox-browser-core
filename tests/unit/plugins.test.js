@@ -70,6 +70,34 @@ describe('lib/plugins', () => {
       expect(results.length).toBe(2);
     });
 
+    test('emitAsync runs listeners one after another in registration order', async () => {
+      const events = createPluginEvents();
+      const payload = { options: {} };
+
+      events.on('mutate', async ({ options }) => {
+        await new Promise((r) => setTimeout(r, 20));
+        options.value = 'first';
+      });
+      events.on('mutate', ({ options }) => {
+        options.value = 'second';
+      });
+
+      await events.emitAsync('mutate', payload);
+      expect(payload.options.value).toBe('second');
+    });
+
+    test('emitAsync runs every listener even if one throws, then rethrows the first error', async () => {
+      const events = createPluginEvents();
+      const results = [];
+
+      events.on('fail', () => { throw new Error('first failure'); });
+      events.on('fail', async () => { throw new Error('second failure'); });
+      events.on('fail', () => { results.push('last ran'); });
+
+      await expect(events.emitAsync('fail', {})).rejects.toThrow('first failure');
+      expect(results).toEqual(['last ran']);
+    });
+
     test('emitAsync with no listeners resolves immediately', async () => {
       const events = createPluginEvents();
       await events.emitAsync('nonexistent', {});
@@ -260,6 +288,177 @@ describe('lib/plugins', () => {
       }
     });
   });
+  describe('required plugins and plugin order', () => {
+    let tmpDir;
+    let pluginsDir;
+
+    beforeEach(() => {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'camofox-plugin-required-test-'));
+      pluginsDir = path.join(tmpDir, 'plugins');
+      fs.mkdirSync(pluginsDir);
+      fs.writeFileSync(path.join(tmpDir, 'package.json'), '{ "type": "module" }\n');
+    });
+
+    afterEach(() => {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    function makeCtx() {
+      return { log: jest.fn(), events: createPluginEvents(), sessions: new Map(), config: {} };
+    }
+
+    // A plugin that records its registration and, on session:creating, sets
+    // contextOptions.marker (after an await when asyncDelayMs is given).
+    function recordingPlugin(root, name, { asyncDelayMs = 0 } = {}) {
+      const dir = path.join(root, name);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'index.js'), `
+export function register(app, ctx) {
+  app.loaded.push(${JSON.stringify(name)});
+  ctx.events.on('session:creating', async ({ contextOptions }) => {
+    if (${asyncDelayMs}) await new Promise((r) => setTimeout(r, ${asyncDelayMs}));
+    contextOptions.marker = ${JSON.stringify(name)};
+  });
+}
+`);
+    }
+
+    function throwingPlugin(root, name) {
+      const dir = path.join(root, name);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'index.js'), 'export function register() { throw new Error("register exploded"); }\n');
+    }
+
+    function writeConfig(plugins) {
+      const configPath = path.join(tmpDir, 'camofox.config.json');
+      fs.writeFileSync(configPath, JSON.stringify({ plugins }));
+      return configPath;
+    }
+
+    test('a required plugin that throws in register stops loading with an error naming it', async () => {
+      recordingPlugin(pluginsDir, 'alpha');
+      throwingPlugin(pluginsDir, 'broken');
+      const configPath = writeConfig({ alpha: {}, broken: { required: true } });
+
+      const error = await loadPlugins({ loaded: [] }, makeCtx(), { pluginsDir, configPath }).catch((err) => err);
+
+      expect(error).toMatchObject({ code: 'plugin_required_failed', plugin: 'broken' });
+      expect(error.message).toContain('"broken"');
+      expect(error.message).toContain('register exploded');
+      expect(error.cause?.message).toBe('register exploded');
+    });
+
+    test('a non-required plugin that throws in register is only logged', async () => {
+      recordingPlugin(pluginsDir, 'alpha');
+      throwingPlugin(pluginsDir, 'broken');
+      const configPath = writeConfig({ alpha: {}, broken: { required: false } });
+      const ctx = makeCtx();
+      const app = { loaded: [] };
+
+      const loaded = await loadPlugins(app, ctx, { pluginsDir, configPath });
+
+      expect(loaded).toEqual(['alpha']);
+      expect(ctx.log).toHaveBeenCalledWith('error', 'plugin load failed', expect.objectContaining({ plugin: 'broken' }));
+    });
+
+    test('a required plugin that is absent stops loading before any plugin registers', async () => {
+      recordingPlugin(pluginsDir, 'alpha');
+      const configPath = writeConfig({ alpha: {}, ghost: { required: true } });
+      const app = { loaded: [] };
+
+      await expect(loadPlugins(app, makeCtx(), { pluginsDir, configPath }))
+        .rejects.toMatchObject({ code: 'plugin_required_failed', plugin: 'ghost', message: expect.stringContaining('not found') });
+      expect(app.loaded).toEqual([]);
+    });
+
+    test('a required plugin without index.js, disabled, or without register is an error', async () => {
+      fs.mkdirSync(path.join(pluginsDir, 'empty'));
+      await expect(loadPlugins({ loaded: [] }, makeCtx(), { pluginsDir, configPath: writeConfig({ empty: { required: true } }) }))
+        .rejects.toMatchObject({ code: 'plugin_required_failed', message: expect.stringContaining('no index.js') });
+
+      recordingPlugin(pluginsDir, 'off');
+      await expect(loadPlugins({ loaded: [] }, makeCtx(), { pluginsDir, configPath: writeConfig({ off: { enabled: false, required: true } }) }))
+        .rejects.toMatchObject({ code: 'plugin_required_failed', message: expect.stringContaining('disabled') });
+
+      const dir = path.join(pluginsDir, 'noexport');
+      fs.mkdirSync(dir);
+      fs.writeFileSync(path.join(dir, 'index.js'), 'export const nothing = 1;\n');
+      await expect(loadPlugins({ loaded: [] }, makeCtx(), { pluginsDir, configPath: writeConfig({ noexport: { required: true } }) }))
+        .rejects.toMatchObject({ code: 'plugin_required_failed', message: expect.stringContaining('register function') });
+    });
+
+    test('a required external plugin loads normally', async () => {
+      const extra = path.join(tmpDir, 'extra');
+      recordingPlugin(extra, 'guard');
+      const configPath = writeConfig({ guard: { required: true } });
+      const app = { loaded: [] };
+
+      const loaded = await loadPlugins(app, makeCtx(), { pluginsDir, pluginPaths: [extra], configPath });
+
+      expect(loaded).toEqual(['guard']);
+    });
+
+    test('plugins register in "order", lower first, ties keep folder order', async () => {
+      const extra = path.join(tmpDir, 'extra');
+      for (const name of ['alpha', 'beta', 'gamma']) recordingPlugin(pluginsDir, name);
+      recordingPlugin(extra, 'delta');
+      const configPath = writeConfig({
+        alpha: { order: 10 },
+        beta: {},
+        gamma: { order: -5 },
+        delta: { order: 0 },
+      });
+      const app = { loaded: [] };
+
+      const loaded = await loadPlugins(app, makeCtx(), { pluginsDir, pluginPaths: [extra], configPath });
+
+      expect(loaded).toEqual(['gamma', 'beta', 'delta', 'alpha']);
+      expect(app.loaded).toEqual(loaded);
+    });
+
+    test('a later plugin\'s change to contextOptions wins, even over an async earlier listener', async () => {
+      recordingPlugin(pluginsDir, 'aaa-last', { asyncDelayMs: 0 });
+      recordingPlugin(pluginsDir, 'zzz-first', { asyncDelayMs: 20 });
+      const configPath = writeConfig({ 'aaa-last': { order: 100 }, 'zzz-first': {} });
+      const ctx = makeCtx();
+
+      await loadPlugins({ loaded: [] }, ctx, { pluginsDir, configPath });
+      const contextOptions = {};
+      await ctx.events.emitAsync('session:creating', { userId: 'u1', contextOptions });
+
+      expect(contextOptions.marker).toBe('aaa-last');
+    });
+
+    test('invalid "order" or "required" values and a broken config file are errors', async () => {
+      recordingPlugin(pluginsDir, 'alpha');
+      await expect(loadPlugins({ loaded: [] }, makeCtx(), { pluginsDir, configPath: writeConfig({ alpha: { order: '100' } }) }))
+        .rejects.toMatchObject({ code: 'plugin_config_invalid' });
+      await expect(loadPlugins({ loaded: [] }, makeCtx(), { pluginsDir, configPath: writeConfig({ alpha: { required: 'yes' } }) }))
+        .rejects.toMatchObject({ code: 'plugin_config_invalid' });
+
+      const brokenPath = path.join(tmpDir, 'broken.json');
+      fs.writeFileSync(brokenPath, '{ "plugins": { "alpha": { "required": true } ');
+      await expect(loadPlugins({ loaded: [] }, makeCtx(), { pluginsDir, configPath: brokenPath }))
+        .rejects.toMatchObject({ code: 'plugin_config_invalid' });
+
+      await expect(loadPlugins({ loaded: [] }, makeCtx(), { pluginsDir, configPath: path.join(tmpDir, 'missing.json') }))
+        .rejects.toMatchObject({ code: 'plugin_config_invalid' });
+    });
+
+    test('without "required" or "order" plugins load in folder order and failures are logged (default unchanged)', async () => {
+      recordingPlugin(pluginsDir, 'beta');
+      throwingPlugin(pluginsDir, 'alpha');
+      recordingPlugin(pluginsDir, 'gamma');
+      const configPath = writeConfig(['alpha', 'beta', 'gamma']);
+      const ctx = makeCtx();
+
+      const loaded = await loadPlugins({ loaded: [] }, ctx, { pluginsDir, configPath });
+
+      expect(loaded).toEqual(['beta', 'gamma']);
+      expect(ctx.log).toHaveBeenCalledWith('error', 'plugin load failed', expect.objectContaining({ plugin: 'alpha' }));
+    });
+  });
+
   describe('external plugin folders (CAMOFOX_PLUGIN_PATH)', () => {
     const __dirname = path.dirname(fileURLToPath(import.meta.url));
     const FIXTURE_PLUGINS = path.join(__dirname, '../fixtures/external-plugins');

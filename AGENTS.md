@@ -321,10 +321,11 @@ export function register(app, ctx) {
 | `failuresTotal` | `Counter` | Prometheus counter: `failuresTotal.labels(type, action).inc()` |
 | `createMetric` | `async function` | Create a Prometheus metric registered to the shared registry (see below) |
 | `metricsRegistry` | `function` | `metricsRegistry()` -- raw prom-client Registry or null |
+| `fulfillBlockedNavigation` | `async function` | `fulfillBlockedNavigation(route, { status, code, reason, recovery, contentType, body })` -- answer a route as a blocked navigation (see "Refusing or blocking navigations") |
 
-### Events (29)
+### Events (30)
 
-28 emitted by core, 1 (`session:storage:export`) emitted by plugins.
+29 emitted by core, 1 (`session:storage:export`) emitted by plugins.
 
 #### Browser Lifecycle
 | Event | Payload | Mutating? |
@@ -347,6 +348,7 @@ export function register(app, ctx) {
 | Event | Payload |
 |-------|---------|
 | `tab:created` | `{ userId, tabId, page, url }` |
+| `tab:navigating` | `{ userId, tabId, url, source, page }` -- awaited before every API navigation; may refuse it |
 | `tab:navigated` | `{ userId, tabId, url, prevUrl }` |
 | `tab:destroyed` | `{ userId, tabId, reason }` |
 | `tab:recycled` | `{ userId, tabId }` |
@@ -389,7 +391,7 @@ export function register(app, ctx) {
 
 ### Mutating Hooks
 
-`browser:launching`, `session:creating`, `session:created`, and `session:destroyed` are emitted via `events.emitAsync()` -- the server awaits all listeners (including async ones) before proceeding. This ensures async work like loading storage state from disk completes before the context is created.
+`browser:launching`, `session:creating`, `session:created`, `session:destroyed`, and `tab:navigating` are emitted via `events.emitAsync()` -- the server awaits all listeners (including async ones) before proceeding. This ensures async work like loading storage state from disk completes before the context is created.
 
 `emitAsync()` runs listeners one after another, in the order they were added (plugin order, see `order` below), so a later plugin's change to the payload wins even when an earlier listener awaits before mutating. Every listener runs; if any throws, the first error is rethrown after the last one finishes.
 
@@ -409,6 +411,37 @@ events.on('session:creating', ({ userId, contextOptions }) => {
   if (saved) contextOptions.storageState = saved;
 });
 ```
+
+### Refusing or blocking navigations
+
+`tab:navigating` is awaited before every navigation the API asks for (`POST /tabs` with a `url`, `POST /tabs/:tabId/navigate` including its retries and search fallbacks, `POST /tabs/open`, `POST /navigate`), with `source: 'api'`, the normalized `userId`, the `tabId`, the target `url` and the `page`. Internal navigations (e.g. warming up a search engine's home page) do not emit it. A listener can prepare for the navigation (for example install a route on `page.context()`) or refuse it by throwing a structured error:
+
+```js
+events.on('tab:navigating', async ({ userId, url }) => {
+  if (isForbidden(url)) {
+    throw { statusCode: 403, code: 'url_forbidden', reason: `${new URL(url).host} is not allowed`, recovery: 'ask_user' };
+  }
+});
+```
+
+`statusCode` must be 400-599 and `code` a short token (`[A-Za-z0-9_.:-]`); `reason` (or `message`) becomes the error text, `recovery` is an optional hint. Nothing is navigated, and a tab that `POST /tabs` or `POST /tabs/open` created only for this navigation is closed again. Any other error thrown by a listener fails the navigation as an ordinary error (fail closed). As with every `emitAsync()` hook, later listeners still run after one throws.
+
+A plugin's route can also answer a main-frame navigation itself and report it as blocked, so the tab shows an explanation page while the API caller gets a clear answer:
+
+```js
+await context.route('**/*', async (route) => {
+  const request = route.request();
+  if (!request.isNavigationRequest() || !isForbidden(request.url())) return route.fallback();
+  await ctx.fulfillBlockedNavigation(route, {
+    status: 423, code: 'url_on_hold', reason: 'This site is on hold', recovery: 'wait_and_retry',
+    body: '<!doctype html><title>On hold</title><p>This site is on hold.</p>',
+  });
+});
+```
+
+`fulfillBlockedNavigation` fulfills the route (status, `content-type`, `cache-control: no-store`, and the header `x-camofox-blocked: <code>`) and remembers the request; only responses answered through it count as blocks, so a website sending the same header is an ordinary page.
+
+Either way the API responds with the block's status and `{ "error": reason, "code": code, "retryable": <true when a recovery is given>, "recovery": recovery, "blocked": { "code": code, "reason": reason } }`. A blocked navigation is an answer, not a browser failure: it does not count toward the consecutive navigation failures that recover a session, and it never rotates a proxy.
 
 ### Virtual display
 

@@ -32,7 +32,9 @@ Disabled by default. Enable with `ENABLE_VNC=1` env var or `"vnc": { "enabled": 
 
 ## Architecture
 
-The plugin registers the `virtualDisplay` capability for its own `plugins.vnc` settings, selecting a higher-resolution display (default 1920x1080 instead of 1x1). A second plugin cannot silently replace that provider. `vnc-watcher.sh` polls for the Xvfb process, then attaches x11vnc + noVNC on top.
+The plugin registers the `virtualDisplay` capability for its own `plugins.vnc` settings, selecting a higher-resolution display (default 1920x1080 instead of 1x1). A second plugin cannot silently replace that provider. `vnc-watcher.sh` polls for the Xvfb process, then attaches x11vnc + noVNC on top. The display class comes from the core (`ctx.VirtualDisplay`), which picks a free display (or `DISPLAY`) and cleans up after it; the plugin only sets the resolution.
+
+The watcher lives only as long as the server that started it: every loop it checks that the server is alive and still its parent, and exits otherwise. On exit (server gone, SIGTERM from `server:shutdown`, or a service stop) it stops the x11vnc and websockify it started (TERM, then KILL after 3 s), so no orphan keeps the VNC/noVNC ports bound or holds up a service stop. x11vnc runs as the watcher's child (no `-bg`), so the watcher stops exactly its own x11vnc.
 
 ## Original Contributors
 

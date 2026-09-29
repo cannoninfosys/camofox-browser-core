@@ -657,6 +657,7 @@ Browser behavior can be tuned in `camofox.config.json`:
 | `CAMOFOX_CONFIG` | Path to `camofox.config.json` (plugin list and settings) | the install folder's `camofox.config.json` |
 | `CAMOFOX_PLUGIN_PATH` | Extra plugin folders, separated like `PATH` (`:`; `;` on Windows), loaded after the built-in `plugins/`. A plugin name that exists in more than one folder stops startup with an error. Per-plugin `required` and `order` in `camofox.config.json`: see `AGENTS.md` | - |
 | `CAMOFOX_INTERACTIVE` | Interactive browser mode: `desktop` opens a real local Camoufox window; `off` keeps normal headless behavior | `off` |
+| `DISPLAY` | Linux, non-desktop mode: X display number for the Xvfb virtual display (`:N`). Used when no other X server holds it; otherwise, or when unset, Camofox picks the first free display from `:500` (never one another X server holds, e.g. Xwayland's `:0`) | - |
 | `HANDLER_TIMEOUT_MS` | Max time for any handler | `30000` (30s) |
 | `MAX_CONCURRENT_PER_USER` | Concurrent request cap per user | `3` |
 | `MAX_OLD_SPACE_SIZE` | Node.js V8 heap limit (MB) | `128` |

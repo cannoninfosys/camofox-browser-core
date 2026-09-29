@@ -29,9 +29,11 @@ describe('launch compatibility source contract', () => {
     );
 
     expect(defaultVirtualDisplay).toContain("DEFAULT_VIRTUAL_DISPLAY_RESOLUTION = '1280x720x24'");
-    expect(defaultVirtualDisplay).toContain('class DefaultVirtualDisplay extends VirtualDisplay');
+    expect(defaultVirtualDisplay).toContain('const SafeVirtualDisplay = createSafeVirtualDisplay(VirtualDisplay, {');
+    expect(defaultVirtualDisplay).toContain('class DefaultVirtualDisplay extends SafeVirtualDisplay');
     expect(defaultVirtualDisplay).toContain('patched[idx + 1] = DEFAULT_VIRTUAL_DISPLAY_RESOLUTION');
     expect(pluginContext).toContain('registerVirtualDisplayProvider: (pluginName, factory) => virtualDisplayRegistry.register(pluginName, factory)');
+    expect(pluginContext).toContain('VirtualDisplay: SafeVirtualDisplay,');
   });
 
   test('does not configure a fixed default browser context viewport', () => {

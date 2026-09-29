@@ -9,6 +9,10 @@
 #   VIEW_ONLY       "1" for view-only mode
 #   VNC_PORT        VNC port (default: 5900)
 #   NOVNC_PORT      noVNC websocket port (default: 6080)
+#
+# The watcher exits when the server that started it exits (checked every loop),
+# and on exit stops the x11vnc and websockify it started, so nothing keeps the
+# ports bound or delays a service stop.
 
 set -e
 
@@ -26,13 +30,23 @@ clear_status() { [ -z "$VNC_STATUS_FILE" ] || rm -f "$VNC_STATUS_FILE"; }
 write_status() {
   [ -z "$VNC_STATUS_FILE" ] || printf '%s %s\n' "$CURRENT_DISPLAY" "$X11VNC_PID" > "$VNC_STATUS_FILE"
 }
-trap clear_status EXIT
-trap 'exit 0' INT TERM
-clear_status
 
 CURRENT_DISPLAY=""
 X11VNC_PID=""
+WEBSOCKIFY_PID=""
 SERVER_PID="$PPID"
+SELF_PID="$$"
+X11_LOCK_DIR="${X11_LOCK_DIR:-/tmp}"
+X11_SOCKET_DIR="${X11_SOCKET_DIR:-/tmp/.X11-unix}"
+
+cleanup() {
+  set +e
+  stop_pids "$X11VNC_PID" "$WEBSOCKIFY_PID"
+  clear_status
+}
+trap cleanup EXIT
+trap 'exit 0' INT TERM HUP
+clear_status
 
 # Prepare password file if requested
 PASSFILE=""
@@ -46,7 +60,7 @@ else
 fi
 
 # Start noVNC (websockify) -- proxies to x11vnc regardless of whether it's up yet
-NOVNC_DIR="/usr/share/novnc"
+NOVNC_DIR="${NOVNC_DIR:-/usr/share/novnc}"
 if [ ! -d "$NOVNC_DIR" ]; then
   log "ERROR: $NOVNC_DIR not found; noVNC cannot start"
   exit 1
@@ -54,21 +68,26 @@ fi
 VNC_BIND="${VNC_BIND:-127.0.0.1}"
 log "Starting noVNC (websockify) on $VNC_BIND:$NOVNC_PORT -> 127.0.0.1:$VNC_PORT"
 websockify --web "$NOVNC_DIR" "$VNC_BIND:$NOVNC_PORT" "127.0.0.1:$VNC_PORT" >/tmp/camofox-novnc.log 2>&1 &
+WEBSOCKIFY_PID=$!
 
 log "VNC watcher started -- will attach x11vnc when Camoufox's Xvfb appears"
 
 find_owned_display() {
-  # Camoufox normally starts Xvfb with -displayfd, so its display number is not
-  # present in argv. First identify this server's Xvfb child, then map its PID
-  # through Xvfb's lock file to the corresponding X socket. This retains the
-  # per-server ownership isolation needed when several Camofox servers share a
-  # process namespace.
+  # Identify this server's Xvfb child, then map its PID through Xvfb's lock
+  # file (or, for a lock-free -displayfd start, its sockets) to the display.
+  # This retains the per-server ownership isolation needed when several
+  # Camofox servers share a process namespace.
   XVFB_PID=$(ps -eo pid=,ppid=,args= 2>/dev/null | find_owned_xvfb_pid "$SERVER_PID" "$VNC_RESOLUTION")
   [ -n "$XVFB_PID" ] || return 0
-  display_for_xvfb_pid "$XVFB_PID" /tmp /tmp/.X11-unix /proc
+  display_for_xvfb_pid "$XVFB_PID" "$X11_LOCK_DIR" "$X11_SOCKET_DIR" /proc
 }
 
 while true; do
+  if ! server_alive "$SERVER_PID" "$SELF_PID"; then
+    log "Camofox server (pid=$SERVER_PID) is gone; stopping"
+    exit 0
+  fi
+
   # A browser restart commonly recreates Xvfb on the same display number.
   # Clear stale state when this watcher's own x11vnc process has exited so the
   # same display can be attached again.
@@ -83,16 +102,16 @@ while true; do
 
   if [ -n "$FOUND" ] && [ "$FOUND" != "$CURRENT_DISPLAY" ]; then
     # New or changed display -- (re)attach x11vnc
-    if [ -n "$X11VNC_PID" ] && kill -0 "$X11VNC_PID" 2>/dev/null; then
+    if pid_running "$X11VNC_PID"; then
       log "Camoufox display changed ($CURRENT_DISPLAY -> $FOUND), restarting x11vnc"
-      kill "$X11VNC_PID" 2>/dev/null || true
-      sleep 0.5
+      stop_pids "$X11VNC_PID"
     fi
 
     CURRENT_DISPLAY="$FOUND"
     log "Attaching x11vnc to DISPLAY=$CURRENT_DISPLAY"
 
-    X11VNC_ARGS="-display $CURRENT_DISPLAY -forever -shared -localhost -rfbport $VNC_PORT -noxdamage -quiet -bg -o /tmp/camofox-x11vnc.log"
+    # No -bg: x11vnc stays our child, so we know its PID and can stop exactly it.
+    X11VNC_ARGS="-display $CURRENT_DISPLAY -forever -shared -localhost -rfbport $VNC_PORT -noxdamage -quiet -o /tmp/camofox-x11vnc.log"
     [ "${VIEW_ONLY:-0}" = "1" ] && X11VNC_ARGS="$X11VNC_ARGS -viewonly"
     if [ -n "$PASSFILE" ]; then
       X11VNC_ARGS="$X11VNC_ARGS -rfbauth $PASSFILE"
@@ -101,21 +120,17 @@ while true; do
     fi
 
     # shellcheck disable=SC2086
-    if ! x11vnc $X11VNC_ARGS; then
-      log "x11vnc failed to start on DISPLAY=$CURRENT_DISPLAY; will retry"
-      CURRENT_DISPLAY=""
-      sleep 2
-      continue
-    fi
+    x11vnc $X11VNC_ARGS </dev/null &
+    X11VNC_PID=$!
     sleep 1
-    X11VNC_PID=$(pgrep -f "x11vnc.*-display $CURRENT_DISPLAY" | head -1 || true)
-    if [ -n "$X11VNC_PID" ]; then
+    if pid_running "$X11VNC_PID"; then
       write_status
       log "x11vnc running (pid=$X11VNC_PID) on DISPLAY=$CURRENT_DISPLAY"
     else
       log "x11vnc did not stay running on DISPLAY=$CURRENT_DISPLAY; will retry"
       clear_status
       CURRENT_DISPLAY=""
+      X11VNC_PID=""
     fi
   fi
 

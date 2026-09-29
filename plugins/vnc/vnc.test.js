@@ -29,11 +29,6 @@ jest.unstable_mockModule('./vnc-launcher.js', () => ({
   startWatcher: mockStartWatcher,
 }));
 
-const mockRemoveXvfbDisplayFiles = jest.fn();
-jest.unstable_mockModule('../../lib/tmp-cleanup.js', () => ({
-  removeXvfbDisplayFiles: mockRemoveXvfbDisplayFiles,
-}));
-
 // Mock auth middleware
 jest.unstable_mockModule('../../lib/auth.js', () => ({
   requireAuth: () => (_req, _res, next) => next(),
@@ -86,7 +81,6 @@ describe('vnc plugin', () => {
     mockStartWatcher.mockClear();
     mockStartWatcher.mockImplementation(mockWatcher);
     mockResolveVncConfig.mockClear();
-    mockRemoveXvfbDisplayFiles.mockClear();
     mockResolveVncConfig.mockImplementation((pluginConfig = {}) => ({
       enabled: pluginConfig.enabled || false,
       resolution: pluginConfig.resolution
@@ -184,22 +178,13 @@ describe('vnc plugin', () => {
     expect(args[screenIdx + 1]).toBe('1920x1080x32');
   });
 
-  test('removes display files only after its Xvfb process exits', async () => {
+  test('leaves display selection and cleanup to the core VirtualDisplay class', async () => {
     await register(mockApp, ctx, { enabled: true });
     const display = ctx.createVirtualDisplay();
-    const proc = new EventEmitter();
-    proc.exitCode = null;
-    proc.killed = false;
-    proc.kill = jest.fn(() => { proc.killed = true; });
-    display.proc = proc;
+    const proto = Object.getPrototypeOf(display);
 
-    display.kill();
-
-    expect(proc.kill).toHaveBeenCalled();
-    expect(mockRemoveXvfbDisplayFiles).not.toHaveBeenCalled();
-    proc.exitCode = 0;
-    proc.emit('exit');
-    expect(mockRemoveXvfbDisplayFiles).toHaveBeenCalledWith(99);
+    expect(display).toBeInstanceOf(MockVirtualDisplay);
+    expect(Object.getOwnPropertyNames(proto).sort()).toEqual(['constructor', 'xvfb_args']);
   });
 
   test('storage_state endpoint returns 404 for unknown user', async () => {

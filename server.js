@@ -40,7 +40,7 @@ import {
   startMemoryReporter, stopMemoryReporter,
 } from './lib/metrics.js';
 import { actionFromReq, classifyError } from './lib/request-utils.js';
-import { cleanupOrphanedTempFiles, cleanupStaleFirefoxProfiles, removeXvfbDisplayFiles } from './lib/tmp-cleanup.js';
+import { cleanupOrphanedTempFiles, cleanupStaleFirefoxProfiles } from './lib/tmp-cleanup.js';
 import { coalesceInflight } from './lib/inflight.js';
 import { INTERACTIVE_ROLES } from './lib/interactive-roles.js';
 import { selectOption } from './lib/select-option.js';
@@ -54,6 +54,7 @@ import { mountDocs } from './lib/openapi.js';
 import { initSentry, captureException as sentryCaptureException, setupExpressErrorHandler as setupSentryErrorHandler, flush as sentryFlush } from './lib/sentry.js';
 import { prepareExternalCamoufoxExecutable } from './lib/camoufox-executable.js';
 import { createVirtualDisplayRegistry } from './lib/plugin-capabilities.js';
+import { createSafeVirtualDisplay } from './lib/virtual-display.js';
 import { killProcessIds } from './lib/browser-processes.js';
 import { snapshotOwnedBrowserProcesses, survivingOwnedBrowserProcesses, profilePathsFromProcessSnapshot } from './lib/process-ownership.js';
 import { killWindowsProcessTree, refreshWindowsProcesses } from './lib/windows-processes.js';
@@ -862,7 +863,15 @@ function getTotalTabCount() {
 // via Mesa llvmpipe. Without this, WebGL returns "no context" -- a massive bot signal.
 const DEFAULT_VIRTUAL_DISPLAY_RESOLUTION = '1280x720x24';
 
-class DefaultVirtualDisplay extends VirtualDisplay {
+// Picks the display itself instead of `Xvfb -displayfd`, which can take a display
+// another X server holds (see lib/virtual-display.js); honors DISPLAY when free.
+// Plugins get this class as ctx.VirtualDisplay, so their displays are safe too.
+const SafeVirtualDisplay = createSafeVirtualDisplay(VirtualDisplay, {
+  assignedDisplay: CONFIG.display,
+  log: (level, msg, fields) => log(level, msg, fields),
+});
+
+class DefaultVirtualDisplay extends SafeVirtualDisplay {
   get xvfb_args() {
     const args = super.xvfb_args;
     const idx = args.indexOf('0');
@@ -872,17 +881,6 @@ class DefaultVirtualDisplay extends VirtualDisplay {
       return patched;
     }
     return args;
-  }
-
-  kill() {
-    const proc = this.proc;
-    if (!proc || this.xvfbDisplayFilesCleanupRegistered) return super.kill();
-
-    this.xvfbDisplayFilesCleanupRegistered = true;
-    const cleanup = () => removeXvfbDisplayFiles(this.display);
-    if (proc.exitCode === null) proc.once('exit', cleanup);
-    else cleanup();
-    return super.kill();
   }
 }
 
@@ -1141,7 +1139,7 @@ async function launchBrowserInstance() {
       if (os.platform() === 'linux' && !useDesktopWindow) {
         localVirtualDisplay = virtualDisplayRegistry.create();
         vdDisplay = await localVirtualDisplay.get();
-        log('info', 'xvfb virtual display started', { display: vdDisplay, attempt });
+        log('info', 'xvfb virtual display started', { display: vdDisplay, assigned: !!localVirtualDisplay.displayAssigned, attempt });
       }
     } catch (err) {
       log('warn', 'xvfb not available, falling back to headless', { error: err.message, attempt });
@@ -7118,8 +7116,8 @@ const pluginCtx = {
   metricsRegistry: getRegister,
   createMetric,
   registerVirtualDisplayProvider: (pluginName, factory) => virtualDisplayRegistry.register(pluginName, factory),
-  /** The upstream VirtualDisplay class -- plugins can subclass it. */
-  VirtualDisplay,
+  /** The VirtualDisplay class (camoufox-js, with safe display selection) -- plugins can subclass it. */
+  VirtualDisplay: SafeVirtualDisplay,
 };
 // A plugin error that must stop startup (a required plugin failed, invalid plugin
 // config, name clash) exits with EX_CONFIG (78) -- a configuration problem, not a

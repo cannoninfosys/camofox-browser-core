@@ -7356,6 +7356,11 @@ const pluginCtx = {
   VirtualDisplay: SafeVirtualDisplay,
   /** Answer a route as a blocked navigation (lib/navigation-block.js); the API caller gets the block. */
   fulfillBlockedNavigation: navigationBlocks.fulfill,
+  /** The hooks this core awaits (emitAsync): a plugin that relies on one can refuse to load without it. */
+  awaitedHooks: Object.freeze([
+    'browser:launching', 'browser:warming', 'session:resolving', 'session:creating', 'session:created',
+    'session:destroying', 'session:destroyed', 'tab:navigating', 'tab:acting', 'server:shutdown',
+  ]),
 };
 // A plugin error that must stop startup (a required plugin failed, invalid plugin
 // config, name clash) exits with EX_CONFIG (78) -- a configuration problem, not a

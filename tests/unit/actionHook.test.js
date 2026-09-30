@@ -46,6 +46,11 @@ describe('tab:acting hook and action refusals', () => {
   };
   const title = async (client, tabId) => (await post(`/tabs/${tabId}/evaluate`, { userId: client.userId, expression: 'document.title' })).body.result;
 
+  test('ctx.awaitedHooks names tab:acting and tab:navigating', async () => {
+    const hooks = await (await fetch(`${serverUrl}/action-guard/hooks`)).json();
+    expect(hooks).toEqual(expect.arrayContaining(['tab:acting', 'tab:navigating', 'session:creating']));
+  });
+
   test('a click passes the hook with its locator; a refused click is not performed and answers the block', async () => {
     const client = createClient(serverUrl);
     try {

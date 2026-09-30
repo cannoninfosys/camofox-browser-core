@@ -18,4 +18,5 @@ export async function register(app, ctx) {
   });
 
   app.get('/action-guard/seen', (req, res) => res.json(seen));
+  app.get('/action-guard/hooks', (req, res) => res.json(ctx.awaitedHooks));
 }

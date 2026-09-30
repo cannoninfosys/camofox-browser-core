@@ -401,6 +401,13 @@ export function register(app, ctx) {
 
 Other events use regular `events.emit()` (fire-and-forget).
 
+`ctx.awaitedHooks` lists the hooks this core awaits, so a plugin that depends on one (for example to enforce a
+policy in `tab:acting`) can refuse to load on an older core instead of silently not being called:
+
+```js
+if (!ctx.awaitedHooks?.includes('tab:acting')) throw new Error('this plugin needs the tab:acting hook');
+```
+
 Modify payload objects in-place:
 
 ```js

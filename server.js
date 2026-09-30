@@ -48,7 +48,7 @@ import { selectOption } from './lib/select-option.js';
 import { visibleSelectorCandidate } from './lib/visible-selector.js';
 import { normalizeBrowserKey } from './lib/browser-key.js';
 import { createPageWithSessionRecovery } from './lib/new-page-recovery.js';
-import { createNavigationBlocks, isNavigationBlockedError, toNavigationRefusal } from './lib/navigation-block.js';
+import { createNavigationBlocks, isNavigationBlockedError, toActionRefusal, toNavigationRefusal } from './lib/navigation-block.js';
 import { resolveUploadPaths } from './lib/upload-paths.js';
 import { acquirePageLease, hasActivePageLeases, isPageLeased, releasePageLease, setLeasedPage } from './lib/page-lease.js';
 import { createReporter, createTabHealthTracker, collectResourceSnapshot, classifyProxyError, browserProcessTreeRssMb, browserProcessNameRssMb } from './lib/reporter.js';
@@ -2214,6 +2214,23 @@ async function emitNavigating({ userId, tabId, url, page }) {
   }
 }
 
+// Every API input action (click and its fallbacks, type, press, evaluate) first awaits the `tab:acting` hook, inside
+// the tab lock: a plugin may refuse it (a structured error becomes an ActionBlockedError; any other listener error
+// fails the action). The payload never carries typed text or the expression.
+async function emitActing({ userId, tabId, action, page, ...fields }) {
+  try {
+    await pluginEvents.emitAsync('tab:acting', { userId: normalizeUserId(userId), tabId: tabId || null, action, page, ...fields });
+  } catch (err) {
+    throw toActionRefusal(err);
+  }
+}
+
+// What a typed text would press besides characters (keyboard mode): Enter submits a form, Space presses a button.
+function typedKeys(text, mode) {
+  const keyboard = mode === 'keyboard' && typeof text === 'string';
+  return { hasEnter: keyboard && /[\r\n]/.test(text), hasSpace: keyboard && text.includes(' ') };
+}
+
 async function navigatePage(page, url, { timeout = 30000, userId = null, tabId = null } = {}) {
   if (userId) await emitNavigating({ userId, tabId, url, page });
   const response = await page.goto(url, { waitUntil: 'commit', timeout });
@@ -4016,6 +4033,7 @@ app.post('/tabs/:tabId/click', async (req, res) => {
       // Full mouse event sequence for stubborn JS click handlers (mirrors Swift WebView.swift)
       // Dispatches: mouseover -> mouseenter -> mousedown -> mouseup -> click
       const dispatchMouseSequence = async (locator) => {
+        await acting(locator, 'mouse');
         // boundingBox() with no timeout inherits Playwright's 30s default, which
         // silently eats the entire handler budget when the element detached after
         // the failed click attempt (the page changed under us). Bound it to the
@@ -4053,6 +4071,11 @@ app.post('/tabs/:tabId/click', async (req, res) => {
       // On Google SERPs, skip the normal click attempt (always intercepted by overlays)
       // and go directly to force click -- saves 5s timeout per click
       const onGoogleSerp = isGoogleSerp(tabState.page.url());
+      // tab:acting before the click and again before each fallback (a forced click or a raw mouse sequence lands on
+      // whatever is on top of the element).
+      const acting = (locator, fallback = null) => emitActing({
+        userId, tabId, action: 'click', page: tabState.page, locator, ref: ref || null, selector: ref ? null : selector, fallback,
+      });
       
       const doClick = async (locatorOrSelector, isLocator) => {
         let locator = isLocator ? locatorOrSelector : tabState.page.locator(locatorOrSelector);
@@ -4068,7 +4091,11 @@ app.post('/tabs/:tabId/click', async (req, res) => {
             log('info', 'click constrained selector to visible match', { selector: locatorOrSelector });
           }
         }
-        const click = async (options) => clickWithDownloadGuard(tabState, () => locator.click(options));
+        const click = async (options) => {
+          if (options.force) await acting(locator, 'force');
+          return clickWithDownloadGuard(tabState, () => locator.click(options));
+        };
+        await acting(locator);
         
         if (onGoogleSerp) {
           try {
@@ -4516,6 +4543,10 @@ app.post('/tabs/:tabId/type', async (req, res) => {
         }
         if (!locator) { const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none'; throw new StaleRefsError(ref, maxRef, tabState.refs.size); }
       }
+      await emitActing({
+        userId, tabId, action: 'type', page: tabState.page, locator: locator || (selector ? tabState.page.locator(selector) : null),
+        ref: ref || null, selector: ref ? null : selector || null, mode, submit: shouldSubmit, ...typedKeys(text, mode),
+      });
       
       if (mode === 'fill') {
         if (locator) {
@@ -4709,6 +4740,7 @@ app.post('/tabs/:tabId/press', async (req, res) => {
     const normalizedKey = normalizeBrowserKey(key);
     
     await withTabLock(tabId, async () => {
+      await emitActing({ userId, tabId, action: 'press', page: tabState.page, key: normalizedKey });
       await tabState.page.keyboard.press(normalizedKey);
     });
     
@@ -5618,7 +5650,10 @@ app.post('/tabs/:tabId/evaluate', express.json({ limit: CONFIG.evaluateMaxBodySi
     pluginEvents.emit('tab:evaluate', { userId, tabId: req.params.tabId, expression });
     const result = await withUserLimit(userId, () => withTabLock(
       req.params.tabId,
-      () => tabState.page.evaluate(expression),
+      async () => {
+        await emitActing({ userId, tabId: req.params.tabId, action: 'evaluate', page: tabState.page });
+        return tabState.page.evaluate(expression);
+      },
       requestTimeoutMs(),
       () => destroyTimedOutTab(session, req.params.tabId, 'operation_timeout', userId),
     ));
@@ -7011,11 +7046,16 @@ app.post('/act', async (req, res) => {
             const locator = isLocator ? locatorOrSelector : tabState.page.locator(locatorOrSelector);
             const clickOpts = { timeout: 3000 };
             if (doubleClick) clickOpts.clickCount = 2;
+            const acting = (fallback = null) => emitActing({
+              userId, tabId: targetId, action: 'click', page: tabState.page, locator, ref: ref || null, selector: ref ? null : selector, fallback,
+            });
+            await acting();
             
             try {
               await locator.click(clickOpts);
             } catch (err) {
               if (err.message.includes('intercepts pointer events')) {
+                await acting('force');
                 await locator.click({ ...clickOpts, force: true });
               } else {
                 throw err;
@@ -7063,6 +7103,10 @@ app.post('/act', async (req, res) => {
             }
             if (!locator) { const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none'; throw new StaleRefsError(ref, maxRef, tabState.refs.size); }
           }
+          await emitActing({
+            userId, tabId: targetId, action: 'type', page: tabState.page, locator: locator || (selector ? tabState.page.locator(selector) : null),
+            ref: ref || null, selector: ref ? null : selector || null, mode, submit: !!submit, ...typedKeys(text, mode),
+          });
           
           if (mode === 'fill') {
             if (locator) {
@@ -7085,6 +7129,7 @@ app.post('/act', async (req, res) => {
         case 'press': {
           const { key } = params;
           if (!key) throw new Error('key is required');
+          await emitActing({ userId, tabId: targetId, action: 'press', page: tabState.page, key });
           await tabState.page.keyboard.press(key);
           return { ok: true, targetId };
         }

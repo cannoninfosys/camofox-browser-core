@@ -1,0 +1,8 @@
+{
+  "plugins": {
+    "youtube": { "enabled": false },
+    "persistence": { "enabled": false },
+    "vnc": { "enabled": false },
+    "action-guard": { "enabled": true, "required": true, "order": 10 }
+  }
+}

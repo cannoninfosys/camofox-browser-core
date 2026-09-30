@@ -1,5 +1,5 @@
 import { jest } from '@jest/globals';
-import { BLOCKED_HEADER, NavigationBlockedError, createNavigationBlocks, isNavigationBlockedError, toNavigationRefusal } from '../../lib/navigation-block.js';
+import { ActionBlockedError, BLOCKED_HEADER, NavigationBlockedError, createNavigationBlocks, isNavigationBlockedError, toActionRefusal, toNavigationRefusal } from '../../lib/navigation-block.js';
 import { browserErrorCode, browserErrorRecovery, browserErrorStatus, isRetryableBrowserError, isTimeoutError } from '../../lib/browser-errors.js';
 import { classifyError } from '../../lib/request-utils.js';
 
@@ -100,5 +100,23 @@ describe('createNavigationBlocks', () => {
     await blocks.fulfill(route, { status: 200, code: 'x' });
     expect(route.fulfill.mock.calls[0][0].status).toBe(403);
     await expect(blocks.fulfill(fakeRoute(), { reason: 'no code' })).rejects.toThrow(TypeError);
+  });
+});
+
+describe('toActionRefusal', () => {
+  test('a structured refusal becomes an ActionBlockedError, answered like a navigation block', () => {
+    const err = toActionRefusal({ statusCode: 451, code: 'action_refused', reason: 'Not this button', recovery: 'ask_user' });
+    expect(err).toBeInstanceOf(ActionBlockedError);
+    expect(isNavigationBlockedError(err)).toBe(true);
+    expect(err).toMatchObject({ statusCode: 451, code: 'action_refused', recovery: 'ask_user', phase: 'action', message: 'Not this button' });
+    expect(err.blocked).toEqual({ code: 'action_refused', reason: 'Not this button' });
+    expect(toActionRefusal(err)).toBe(err);
+  });
+
+  test('without a reason it says the action was refused; anything else is left unchanged', () => {
+    expect(toActionRefusal({ statusCode: 403, code: 'x' }).message).toBe('Action refused');
+    const boom = new Error('boom');
+    expect(toActionRefusal(boom)).toBe(boom);
+    expect(toActionRefusal({ statusCode: 200, code: 'ok' })).toEqual({ statusCode: 200, code: 'ok' });
   });
 });

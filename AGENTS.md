@@ -368,6 +368,7 @@ export function register(app, ctx) {
 #### Input
 | Event | Payload |
 |-------|---------|
+| `tab:acting` | `{ userId, tabId, action, page, ... }` -- awaited before every API input action; may refuse it (see "Refusing input actions") |
 | `tab:click` | `{ userId, tabId, ref, selector }` |
 | `tab:type` | `{ userId, tabId, text, ref, mode }` |
 | `tab:scroll` | `{ userId, tabId, direction, amount }` |
@@ -394,7 +395,7 @@ export function register(app, ctx) {
 
 ### Mutating Hooks
 
-`browser:launching`, `browser:warming`, `session:resolving`, `session:creating`, `session:created`, `session:destroyed`, and `tab:navigating` are emitted via `events.emitAsync()` -- the server awaits all listeners (including async ones) before proceeding. This ensures async work like loading storage state from disk completes before the context is created.
+`browser:launching`, `browser:warming`, `session:resolving`, `session:creating`, `session:created`, `session:destroyed`, `tab:navigating` and `tab:acting` are emitted via `events.emitAsync()` -- the server awaits all listeners (including async ones) before proceeding. This ensures async work like loading storage state from disk completes before the context is created.
 
 `emitAsync()` runs listeners one after another, in the order they were added (plugin order, see `order` below), so a later plugin's change to the payload wins even when an earlier listener awaits before mutating. Every listener runs; if any throws, the first error is rethrown after the last one finishes.
 
@@ -445,6 +446,29 @@ await context.route('**/*', async (route) => {
 `fulfillBlockedNavigation` fulfills the route (status, `content-type`, `cache-control: no-store`, and the header `x-camofox-blocked: <code>`) and remembers the request; only responses answered through it count as blocks, so a website sending the same header is an ordinary page.
 
 Either way the API responds with the block's status and `{ "error": reason (shown even when `NODE_ENV=production` hides internal error texts), "code": code, "retryable": <true when a recovery is given>, "recovery": recovery, "blocked": { "code": code, "reason": reason } }`. A blocked navigation is an answer, not a browser failure: it does not count toward the consecutive navigation failures that recover a session, and it never rotates a proxy.
+
+### Refusing input actions
+
+`tab:acting` is awaited inside the tab's lock before every input action the API performs, with the normalized `userId`, the `tabId`, the `action` and the `page`:
+
+| `action` | Routes | Extra fields |
+|----------|--------|--------------|
+| `click` | `POST /tabs/:tabId/click`, `POST /act` (`kind: click`) | `locator` (the element about to be clicked, after ref/selector resolution), `ref`, `selector`, `fallback`: `null` for the click itself, then emitted again before a fallback that clicks whatever is on top of the element: `'force'` (a forced click) or `'mouse'` (a raw mouse sequence at its centre) |
+| `type` | `POST /tabs/:tabId/type`, `POST /act` (`kind: type`) | `locator` (or `null`: keyboard mode into the focused element), `ref`, `selector`, `mode`, `submit` (Enter after typing), `hasEnter` / `hasSpace` (keyboard mode: the text contains a line break / a space, which press Enter / Space); never the text itself |
+| `press` | `POST /tabs/:tabId/press`, `POST /act` (`kind: press`) | `key` |
+| `evaluate` | `POST /tabs/:tabId/evaluate` | (never the expression) |
+
+A listener refuses the action the same way as a navigation, by throwing `{ statusCode, code, reason, recovery? }`: nothing is performed and the API answers exactly like a blocked navigation (the block's status, `{ error, code, retryable, recovery, blocked }`). Any other listener error fails the action (fail closed).
+
+```js
+events.on('tab:acting', async ({ action, locator }) => {
+  if (action !== 'click' || !locator) return;
+  const name = (await locator.textContent({ timeout: 1000 }).catch(() => '')) || '';
+  if (/delete account/i.test(name)) {
+    throw { statusCode: 403, code: 'action_forbidden', reason: 'This button is off limits', recovery: 'ask_user' };
+  }
+});
+```
 
 ### Virtual display
 

@@ -43,6 +43,26 @@ describe('vnc watcher helpers', () => {
     expect(shell('find_owned_xvfb_pid 7 1920x1080x24', [], processes)).toBe('100');
   });
 
+  test('lists every owned Xvfb at the resolution, oldest first', () => {
+    const processes = [
+      '100 7 /usr/bin/Xvfb :500 -screen 0 1920x1080x24',
+      '150 7 /usr/bin/Xvfb :501 -screen 0 1920x1080x24',
+      '200 8 /usr/bin/Xvfb :502 -screen 0 1920x1080x24',
+      '250 7 /usr/bin/Xvfb :503 -screen 0 1280x720x24',
+    ].join('\n');
+
+    expect(shell('list_owned_xvfb_pids 7 1920x1080x24', [], processes)).toBe('100\n150');
+  });
+
+  test('shows the preferred display when it is one of ours, else the newest', () => {
+    const displays = ':500\n:501\n';
+    expect(shell('choose_display ":500"', [], displays)).toBe(':500');
+    expect(shell('choose_display ":501"', [], displays)).toBe(':501');
+    expect(shell('choose_display ":777"', [], displays)).toBe(':501');
+    expect(shell('choose_display ""', [], displays)).toBe(':501');
+    expect(shell('choose_display ":500"', [], '')).toBe('');
+  });
+
   test('maps the owned Xvfb PID through its lock file and real Unix socket', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'camofox-vnc-test-'));
     tempDirs.push(root);

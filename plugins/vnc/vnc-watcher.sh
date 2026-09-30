@@ -9,6 +9,9 @@
 #   VIEW_ONLY       "1" for view-only mode
 #   VNC_PORT        VNC port (default: 5900)
 #   NOVNC_PORT      noVNC websocket port (default: 6080)
+#   VNC_TARGET_FILE If set and it names one of the server's displays (":N"), show
+#                   that one (the browser of the latest session activity); else
+#                   the newest display.
 #
 # The watcher exits when the server that started it exits (checked every loop),
 # and on exit stops the x11vnc and websockify it started, so nothing keeps the
@@ -24,6 +27,7 @@ VNC_PORT="${VNC_PORT:-5900}"
 NOVNC_PORT="${NOVNC_PORT:-6080}"
 VNC_RESOLUTION="${VNC_RESOLUTION:-1920x1080x24}"
 VNC_STATUS_FILE="${VNC_STATUS_FILE:-}"
+VNC_TARGET_FILE="${VNC_TARGET_FILE:-}"
 
 log() { printf '[vnc-watcher] %s\n' "$*" >&2; }
 clear_status() { [ -z "$VNC_STATUS_FILE" ] || rm -f "$VNC_STATUS_FILE"; }
@@ -73,13 +77,20 @@ WEBSOCKIFY_PID=$!
 log "VNC watcher started -- will attach x11vnc when Camoufox's Xvfb appears"
 
 find_owned_display() {
-  # Identify this server's Xvfb child, then map its PID through Xvfb's lock
-  # file (or, for a lock-free -displayfd start, its sockets) to the display.
+  # Identify this server's Xvfb children, then map each PID through Xvfb's lock
+  # file (or, for a lock-free -displayfd start, its sockets) to its display.
   # This retains the per-server ownership isolation needed when several
-  # Camofox servers share a process namespace.
-  XVFB_PID=$(ps -eo pid=,ppid=,args= 2>/dev/null | find_owned_xvfb_pid "$SERVER_PID" "$VNC_RESOLUTION")
-  [ -n "$XVFB_PID" ] || return 0
-  display_for_xvfb_pid "$XVFB_PID" "$X11_LOCK_DIR" "$X11_SOCKET_DIR" /proc
+  # Camofox servers share a process namespace. With several browsers (one
+  # display each) the target file says which one is in use.
+  XVFB_PIDS=$(ps -eo pid=,ppid=,args= 2>/dev/null | list_owned_xvfb_pids "$SERVER_PID" "$VNC_RESOLUTION")
+  [ -n "$XVFB_PIDS" ] || return 0
+  PREFERRED=""
+  if [ -n "$VNC_TARGET_FILE" ] && [ -f "$VNC_TARGET_FILE" ]; then
+    PREFERRED=$(head -n 1 "$VNC_TARGET_FILE" 2>/dev/null || true)
+  fi
+  for pid in $XVFB_PIDS; do
+    display_for_xvfb_pid "$pid" "$X11_LOCK_DIR" "$X11_SOCKET_DIR" /proc
+  done | choose_display "$PREFERRED"
 }
 
 while true; do

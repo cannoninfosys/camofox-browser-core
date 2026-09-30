@@ -102,7 +102,7 @@ describe('launch compatibility source contract', () => {
 
   test('health probe context also uses a null viewport', () => {
     const healthProbeOptions = sourceBetween(
-      'testContext = await browser.newContext(',
+      'testContext = await probeBrowser.newContext(',
       'const page = await testContext.newPage();'
     );
 

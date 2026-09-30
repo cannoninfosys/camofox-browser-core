@@ -1,0 +1,8 @@
+{
+  "plugins": {
+    "youtube": { "enabled": false },
+    "persistence": { "enabled": false },
+    "vnc": { "enabled": false },
+    "browser-fixture": { "enabled": true, "required": true }
+  }
+}

@@ -222,6 +222,18 @@ describe('loadConfig', () => {
     expect(parsePluginPaths(undefined)).toEqual([]);
   });
 
+  test('CAMOFOX_BROWSER names the default browser (camoufox when unset) and is forwarded to server subprocesses', () => {
+    delete process.env.CAMOFOX_BROWSER;
+    expect(loadConfig().browser).toBe('camoufox');
+    process.env.CAMOFOX_BROWSER = '  ';
+    expect(loadConfig().browser).toBe('camoufox');
+    process.env.CAMOFOX_BROWSER = ' chromium ';
+    const config = loadConfig();
+    expect(config.browser).toBe('chromium');
+    expect(config.serverEnv.CAMOFOX_BROWSER).toBe(' chromium ');
+    delete process.env.CAMOFOX_BROWSER;
+  });
+
   test('enables desktop interactive mode from the environment and forwards it to server subprocesses', () => {
     process.env.CAMOFOX_INTERACTIVE = 'desktop';
 

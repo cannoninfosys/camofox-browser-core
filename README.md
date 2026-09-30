@@ -656,6 +656,7 @@ Browser behavior can be tuned in `camofox.config.json`:
 | `BROWSER_IDLE_TIMEOUT_MS` | Kill browser when idle (0 = never) | `300000` (5min) |
 | `CAMOFOX_CONFIG` | Path to `camofox.config.json` (plugin list and settings) | the install folder's `camofox.config.json` |
 | `CAMOFOX_PLUGIN_PATH` | Extra plugin folders, separated like `PATH` (`:`; `;` on Windows), loaded after the built-in `plugins/`. A plugin name that exists in more than one folder stops startup with an error. Per-plugin `required` and `order` in `camofox.config.json`: see `AGENTS.md` | - |
+| `CAMOFOX_BROWSER` | The default browser: `camoufox` (built-in) or the name of a plugin's browser provider (see `AGENTS.md`, "Browser providers"). Pre-warmed and used by sessions; an unknown name stops startup (exit 78) | `camoufox` |
 | `CAMOFOX_INTERACTIVE` | Interactive browser mode: `desktop` opens a real local Camoufox window; `off` keeps normal headless behavior | `off` |
 | `DISPLAY` | Linux, non-desktop mode: X display number for the Xvfb virtual display (`:N`). Used when no other X server holds it; otherwise, or when unset, Camofox picks the first free display from `:500` (never one another X server holds, e.g. Xwayland's `:0`) | - |
 | `HANDLER_TIMEOUT_MS` | Max time for any handler | `30000` (30s) |

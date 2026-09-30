@@ -1,6 +1,7 @@
 import { Camoufox, launchOptions } from 'camoufox-js';
 import { VirtualDisplay } from 'camoufox-js/dist/virtdisplay.js';
-import { firefox } from 'playwright-core';
+import { chromium, firefox } from 'playwright-core';
+import { BUILTIN_BROWSER, createBrowserProviderRegistry, createProviderBrowsers } from './lib/browser-providers.js';
 import express from 'express';
 import crypto from 'crypto';
 import fs from 'fs';
@@ -83,7 +84,7 @@ function _countTabs() {
   return total;
 }
 function _browserPid() {
-  try { return browser?.process?.()?.pid ?? null; } catch { return null; }
+  try { return browser?.process?.()?.pid ?? providerBrowsers.pid(warmBrowserName) ?? null; } catch { return null; }
 }
 function _resourceOpts() {
   return { sessionCount: sessions.size, tabCount: _countTabs(), browserPid: _browserPid() };
@@ -707,11 +708,115 @@ let browserWarmRetryTimer = null;
 let _lastBrowserStopReason = null;
 const INTENTIONAL_STOP_REASONS = new Set(['idle_shutdown', 'admin_stop']);
 
+// --- Browser providers (lib/browser-providers.js) ---
+// The built-in Camoufox keeps the `browser` singleton; a plugin-provided browser is managed by
+// providerBrowsers: launched on first use, idled out without sessions, closed on stop and shutdown.
+// CONFIG.browser (CAMOFOX_BROWSER) is the default browser. A plugin may choose another one per session
+// (session:resolving) and the one to keep warm (browser:warming).
+const browserProviders = createBrowserProviderRegistry();
+let shuttingDown = false;
+
+/** Open sessions on one browser. */
+function sessionsOn(name) {
+  let n = 0;
+  for (const s of sessions.values()) if ((s.browser || BUILTIN_BROWSER) === name) n++;
+  return n;
+}
+
+const providerBrowsers = createProviderBrowsers({
+  registry: browserProviders,
+  emit: (event, payload) => pluginEvents.emit(event, payload),
+  emitAsync: (event, payload) => pluginEvents.emitAsync(event, payload),
+  log,
+  launchEnv: () => ({
+    playwright: { chromium, firefox },
+    VirtualDisplay: SafeVirtualDisplay,
+    interactiveMode: CONFIG.interactiveMode,
+    log,
+  }),
+  createVirtualDisplay: () => virtualDisplayRegistry.create(),
+  sessionsOn,
+  onDisconnected: (name) => closeAllSessions('browser_disconnected', { clearDownloads: true, clearLocks: true, browser: name }),
+  isShuttingDown: () => shuttingDown,
+  launchTimeoutMs: proxyPool?.launchTimeoutMs ?? 60000,
+  idleTimeoutMs: BROWSER_IDLE_TIMEOUT_MS,
+});
+
+/** The running browser for `name`, launched if needed. */
+async function ensureBrowserFor(name) {
+  if (name === BUILTIN_BROWSER) return ensureBrowser();
+  return providerBrowsers.ensure(name);
+}
+
+// The browser kept warm: pre-warmed at startup, relaunched by the warm retry and after a restart,
+// launched by /start and ctx.ensureBrowser. The default browser unless a browser:warming listener
+// names another (e.g. the browser of the one user an instance serves).
+let warmBrowserName = CONFIG.browser;
+
+async function resolveWarmBrowser(reason) {
+  const warming = { browser: CONFIG.browser, reason };
+  try {
+    await pluginEvents.emitAsync('browser:warming', warming);
+  } catch (err) {
+    log('warn', 'browser:warming listener failed; keeping the default browser warm', { error: err.message });
+    warming.browser = CONFIG.browser;
+  }
+  if (!browserProviders.has(warming.browser)) {
+    log('warn', 'browser:warming named an unknown browser; keeping the default browser warm', { browser: warming.browser });
+    warming.browser = CONFIG.browser;
+  }
+  warmBrowserName = warming.browser;
+  return warmBrowserName;
+}
+
+/** The warm browser, launched if needed. */
+async function ensureWarmBrowser(reason = 'plugin') {
+  return ensureBrowserFor(await resolveWarmBrowser(reason));
+}
+
+function isBuiltinRunning() {
+  return browser !== null && (browser.isConnected?.() ?? false);
+}
+
+/** { name: running } for every known browser. */
+function browserStatus() {
+  const status = {};
+  for (const name of browserProviders.names()) {
+    status[name] = name === BUILTIN_BROWSER ? isBuiltinRunning() : providerBrowsers.isRunning(name);
+  }
+  return status;
+}
+
+function isWarmBrowserRunning() {
+  return warmBrowserName === BUILTIN_BROWSER ? isBuiltinRunning() : providerBrowsers.isRunning(warmBrowserName);
+}
+
+function isWarmBrowserLaunching() {
+  return warmBrowserName === BUILTIN_BROWSER ? !!browserLaunchPromise : providerBrowsers.isLaunching(warmBrowserName);
+}
+
+function warmBrowserStopReason() {
+  return warmBrowserName === BUILTIN_BROWSER ? _lastBrowserStopReason : providerBrowsers.lastStopReason(warmBrowserName);
+}
+
+/**
+ * Close every browser in parallel. `deadline` (ms timestamp) bounds a provider's close, so shutdown fits
+ * its force-exit budget; the built-in browser keeps its own close timeout.
+ */
+async function closeAllBrowsers(reason, { deadline = null } = {}) {
+  const timeoutMs = deadline ? Math.max(1000, deadline - Date.now()) : undefined;
+  await Promise.allSettled([
+    closeBrowserFully(reason),
+    providerBrowsers.closeAll(reason, timeoutMs ? { timeoutMs } : {}),
+  ]);
+}
+
 function scheduleBrowserIdleShutdown() {
-  if (browserIdleTimer || sessions.size > 0 || !browser || BROWSER_IDLE_TIMEOUT_MS <= 0) return;
+  providerBrowsers.scheduleIdle();
+  if (browserIdleTimer || sessionsOn(BUILTIN_BROWSER) > 0 || !browser || BROWSER_IDLE_TIMEOUT_MS <= 0) return;
   browserIdleTimer = setTimeout(async () => {
     browserIdleTimer = null;
-    if (sessions.size === 0 && browser) {
+    if (sessionsOn(BUILTIN_BROWSER) === 0 && browser) {
       log('info', 'browser idle shutdown (no sessions)');
       await closeBrowserFully('idle_shutdown');
     }
@@ -747,12 +852,12 @@ function camoufoxInstallRemediation() {
 }
 
 function scheduleBrowserWarmRetry(delayMs = 5000) {
-  if (browserWarmRetryTimer || browser || browserLaunchPromise) return;
+  if (browserWarmRetryTimer || isWarmBrowserRunning() || isWarmBrowserLaunching()) return;
   browserWarmRetryTimer = setTimeout(async () => {
     browserWarmRetryTimer = null;
     try {
       const start = Date.now();
-      await ensureBrowser();
+      await ensureWarmBrowser('retry');
       log('info', 'background browser warm retry succeeded', { ms: Date.now() - start });
     } catch (err) {
       if (isFatalInstallError(err)) {
@@ -831,12 +936,12 @@ async function restartBrowser(reason) {
   try {
     await closeAllSessions(`browser_restart:${reason}`, { clearDownloads: true, clearLocks: true });
     userNavHealth.clear();
-    await closeBrowserFully(`browser_restart:${reason}`);
-    pluginEvents.emit('browser:closed', { reason });
+    // Every browser (each emits browser:closed), then the warm one again.
+    await closeAllBrowsers(`browser_restart:${reason}`);
     // Do NOT clear browserLaunchPromise here — ensureBrowser() owns the
     // single-flight primitive. Clearing it manually opens a window where a
     // concurrent request can start a second launch. See #8554.
-    await ensureBrowser();
+    await ensureWarmBrowser('restart');
     healthState.lastSuccessfulNav = Date.now();
     log('info', 'browser restarted successfully');
   } catch (err) {
@@ -973,7 +1078,9 @@ async function _closeBrowserFullyImpl(reason) {
   // Capture ownership before Playwright closes and reparents its children.
   // Multiple scoped servers may share a host, so a later /proc name scan must
   // never treat another server's browser as one of our survivors.
-  const ownedBrowserProcesses = snapshotOwnedBrowserProcesses(process.pid);
+  // Never a provider browser's processes or displays: that browser keeps running.
+  const providerPids = providerBrowsers.ownedPids();
+  const ownedBrowserProcesses = snapshotOwnedBrowserProcesses(process.pid).filter((proc) => !providerPids.has(proc.pid));
   const preCloseFds = _countOpenFds();
   const preCloseHandles = _countActiveHandles();
 
@@ -1028,6 +1135,7 @@ async function _closeBrowserFullyImpl(reason) {
       });
     }
   }
+  pluginEvents.emit('browser:closed', { reason, provider: BUILTIN_BROWSER });
   log('info', 'browser closed fully', {
     reason, pid, preCloseFds, postCloseFds, preCloseHandles, postCloseHandles,
   });
@@ -1195,7 +1303,7 @@ async function launchBrowserInstance() {
       options.handleSIGTERM = false;
       options.handleSIGINT = false;
       options.handleSIGHUP = false;
-      await pluginEvents.emitAsync('browser:launching', { options });
+      await pluginEvents.emitAsync('browser:launching', { options, provider: BUILTIN_BROWSER });
 
       candidateBrowser = await firefox.launch(options);
 
@@ -1229,7 +1337,7 @@ async function launchBrowserInstance() {
       _lastBrowserStopReason = null; // clear — browser is healthy
       _lastBrowserRestartAt = Date.now();
       attachBrowserCleanup(browser, localVirtualDisplay);
-      pluginEvents.emit('browser:launched', { browser, display: vdDisplay });
+      pluginEvents.emit('browser:launched', { browser, display: vdDisplay, provider: BUILTIN_BROWSER });
 
       log('info', 'camoufox launched', {
         attempt,
@@ -1265,13 +1373,16 @@ async function ensureBrowser() {
   if (browser && !browser.isConnected()) {
     failuresTotal.labels('browser_disconnected', 'internal').inc();
     log('warn', 'browser disconnected, clearing dead sessions and relaunching', {
-      deadSessions: sessions.size,
+      deadSessions: sessionsOn(BUILTIN_BROWSER),
     });
-    await closeAllSessions('browser_disconnected', { clearDownloads: true, clearLocks: true });
+    await closeAllSessions('browser_disconnected', { clearDownloads: true, clearLocks: true, browser: BUILTIN_BROWSER });
     await closeBrowserFully('browser_disconnected');
   }
   if (browser) return browser;
   if (browserLaunchPromise) return browserLaunchPromise;
+  if (shuttingDown) {
+    throw Object.assign(new Error('Server is shutting down'), { statusCode: 503, code: 'server_shutting_down' });
+  }
   const launchTimeoutMs = proxyPool?.launchTimeoutMs ?? 60000;
   browserLaunchPromise = Promise.race([
     launchBrowserInstance(),
@@ -1337,8 +1448,10 @@ async function closeSession(userId, session, {
   refreshActiveTabsGauge();
 }
 
-async function closeAllSessions(reason, { clearDownloads = true, clearLocks = true } = {}) {
-  const openSessions = Array.from(sessions.entries());
+async function closeAllSessions(reason, { clearDownloads = true, clearLocks = true, browser: onlyBrowser = null } = {}) {
+  // `browser`: only the sessions on that browser (e.g. the one that disconnected).
+  const openSessions = Array.from(sessions.entries())
+    .filter(([, s]) => !onlyBrowser || (s.browser || BUILTIN_BROWSER) === onlyBrowser);
   for (const [userId, session] of openSessions) {
     await closeSession(userId, session, { reason, clearDownloads, clearLocks });
   }
@@ -1364,7 +1477,17 @@ async function getSession(userId, { trace = false } = {}) {
       }
     }
   }
-  
+
+  // Which browser this user's session runs on: the default, unless a session:resolving listener
+  // names another. Asked on every call; an open session never moves to another browser (409).
+  const resolving = { userId: key, browser: CONFIG.browser };
+  await pluginEvents.emitAsync('session:resolving', resolving);
+  const browserName = resolving.browser;
+  if (!browserProviders.has(browserName)) {
+    throw Object.assign(new Error(`Unknown browser: ${browserName}`), { statusCode: 500, code: 'browser_unknown' });
+  }
+  if (session) assertSameBrowser(key, session, browserName);
+
   if (!session) {
     session = await coalesceInflight(sessionCreations, key, async () => {
       if (sessions.size >= MAX_SESSIONS) {
@@ -1390,7 +1513,7 @@ async function getSession(userId, { trace = false } = {}) {
           );
         }
       }
-      const b = await ensureBrowser();
+      const b = await ensureBrowserFor(browserName);
       const contextOptions = {
         viewport: null,
         ...contextIdentityOptions({
@@ -1408,7 +1531,7 @@ async function getSession(userId, { trace = false } = {}) {
         contextOptions.proxy = normalizePlaywrightProxy(sessionProxy);
         log('info', 'session proxy assigned', { userId: key, proxy: sessionProxy.server });
       }
-      await pluginEvents.emitAsync('session:creating', { userId: key, contextOptions });
+      await pluginEvents.emitAsync('session:creating', { userId: key, contextOptions, provider: browserName });
       const context = await b.newContext(contextOptions);
 
       let tracePath = null;
@@ -1424,20 +1547,33 @@ async function getSession(userId, { trace = false } = {}) {
         }
       }
 
-      const created = { context, tabGroups: new Map(), pageLeases: new Set(), lastAccess: Date.now(), proxySessionId: sessionProxy?.sessionId || null, tracePath };
+      // `browser`: the browser this session runs on (the default or a provider's name).
+      const created = { context, browser: browserName, tabGroups: new Map(), pageLeases: new Set(), lastAccess: Date.now(), proxySessionId: sessionProxy?.sessionId || null, tracePath };
       sessions.set(key, created);
-      await pluginEvents.emitAsync('session:created', { userId: key, context });
+      await pluginEvents.emitAsync('session:created', { userId: key, context, provider: browserName });
       log('info', 'session created', {
         userId: key,
+        browser: browserName,
         proxyMode: proxyPool?.mode || null,
         proxyServer: sessionProxy?.server || browserLaunchProxy?.server || null,
         proxySession: sessionProxy?.sessionId || browserLaunchProxy?.sessionId || null,
       });
       return created;
     });
+    assertSameBrowser(key, session, browserName); // a concurrent creation may have used another browser
   }
   session.lastAccess = Date.now();
   return session;
+}
+
+function assertSameBrowser(userId, session, wanted) {
+  const open = session.browser || BUILTIN_BROWSER;
+  if (open !== wanted) {
+    throw Object.assign(
+      new Error(`Session for userId "${userId}" is open on ${open}; close it before using ${wanted}`),
+      { statusCode: 409, code: 'browser_mismatch' },
+    );
+  }
 }
 
 async function createLeasedPage(session) {
@@ -1965,7 +2101,7 @@ async function camofoxPressureCleanup(options = {}) {
 
     refreshTabLockQueueDepth();
     refreshActiveTabsGauge();
-    if (sessions.size === 0) scheduleBrowserIdleShutdown();
+    scheduleBrowserIdleShutdown(); // each browser idles out when it has no sessions
   }
 
   return {
@@ -2671,6 +2807,12 @@ async function refreshTabRefs(tabState, options = {}) {
  *                   type: boolean
  *                 browserRunning:
  *                   type: boolean
+ *                   description: Whether any browser is running.
+ *                 browsers:
+ *                   type: object
+ *                   description: Each browser (the built-in camoufox and plugin browser providers) and whether it runs.
+ *                   additionalProperties:
+ *                     type: boolean
  *                 activeTabs:
  *                   type: integer
  *                 activeSessions:
@@ -2693,21 +2835,25 @@ app.get('/health', (req, res) => {
   if (healthState.isRecovering) {
     return res.status(503).json({ ok: false, engine: 'camoufox', recovering: true });
   }
-  const running = browser !== null && (browser.isConnected?.() ?? false);
+  // browserRunning: any browser; browsers: each one (the built-in and every provider).
+  const browsers = browserStatus();
+  const running = Object.values(browsers).some(Boolean);
   const mem = process.memoryUsage();
   const rssMb = Math.round(mem.rss / 1048576);
   const heapUsedMb = Math.round(mem.heapUsed / 1048576);
   const nativeMemMb = rssMb - heapUsedMb;
+  const stopReason = warmBrowserStopReason();
 
-  // Browser not running: distinguish intentional idle stop from unexpected death
-  if (!running && _lastBrowserStopReason && !INTENTIONAL_STOP_REASONS.has(_lastBrowserStopReason)) {
+  // Warm browser not running: distinguish intentional idle stop from unexpected death
+  if (!isWarmBrowserRunning() && stopReason && !INTENTIONAL_STOP_REASONS.has(stopReason)) {
     // Unexpected browser absence — schedule recovery and report unhealthy
     scheduleBrowserWarmRetry();
     return res.status(503).json({
       ok: false,
       engine: 'camoufox',
-      browserRunning: false,
-      reason: _lastBrowserStopReason,
+      browserRunning: running,
+      browsers,
+      reason: stopReason,
       activeTabs: 0,
       activeSessions: sessions.size,
       memory: { rssMb, heapUsedMb, nativeMemMb },
@@ -2720,6 +2866,7 @@ app.get('/health', (req, res) => {
     engine: 'camoufox',
     browserConnected: running,
     browserRunning: running,
+    browsers,
     activeTabs: getTotalTabCount(),
     activeSessions: sessions.size,
     consecutiveFailures: Array.from(userNavHealth.values())
@@ -3145,7 +3292,7 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
     session.lastAccess = Date.now();
 
     const result = await withUserLimit(userId, () => withTimeout((async () => {
-      await ensureBrowser();
+      await ensureBrowserFor(session.browser || BUILTIN_BROWSER); // the session's own browser
       const resolvedSessionKey = sessionKey || listItemId || found.listItemId || 'default';
       let tabState = found.tabState;
       tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
@@ -6016,7 +6163,7 @@ app.delete('/sessions/:userId', async (req, res) => {
       await closeSession(userId, session, { reason: 'api_delete_session', clearDownloads: true, clearLocks: true });
       log('info', 'session closed', { userId });
     }
-    if (sessions.size === 0) scheduleBrowserIdleShutdown();
+    scheduleBrowserIdleShutdown(); // each browser idles out when it has no sessions
     res.json({ ok: true });
   } catch (err) {
     log('error', 'session close failed', { error: err.message });
@@ -6037,10 +6184,8 @@ setInterval(() => {
       log('info', 'session expired', { userId });
     }
   }
-  // When all sessions gone, start idle timer to kill browser
-  if (sessions.size === 0) {
-    scheduleBrowserIdleShutdown();
-  }
+  // Start the idle timer of every browser that has no sessions left
+  scheduleBrowserIdleShutdown();
   refreshTabLockQueueDepth();
 }, 60_000);
 
@@ -6129,7 +6274,7 @@ setInterval(() => {
       sessionsExpiredTotal.inc();
     }
   }
-  if (sessions.size === 0) scheduleBrowserIdleShutdown();
+  scheduleBrowserIdleShutdown(); // each browser idles out when it has no sessions
 }, 60_000);
 
 // Orphan page reaper -- force-closes Playwright pages that survived a safePageClose
@@ -6165,7 +6310,7 @@ setInterval(() => {
 // is large. This prevents idle Firefox children from holding most of the VM RAM
 // while Node reports zero sessions/tabs.
 setInterval(() => {
-  if (sessions.size > 0 || !browser) return;
+  if (sessionsOn(BUILTIN_BROWSER) > 0 || !browser) return;
   const mem = process.memoryUsage();
   const nativeMemMb = Math.round((mem.rss - mem.heapUsed) / 1048576);
   const browserRssMb = browserProcessTreeRssMb(_browserPid()) ?? browserProcessNameRssMb();
@@ -6236,7 +6381,7 @@ setInterval(() => {
  *                   type: boolean
  */
 app.get('/', (req, res) => {
-  const running = browser !== null && (browser.isConnected?.() ?? false);
+  const running = Object.values(browserStatus()).some(Boolean);
   res.json({ 
     ok: true,
     enabled: true,
@@ -6470,7 +6615,7 @@ app.post('/tabs/open', async (req, res) => {
  */
 app.post('/start', async (req, res) => {
   try {
-    await ensureBrowser();
+    await ensureWarmBrowser('start');
     res.json({ ok: true, profile: 'camoufox' });
   } catch (err) {
     failuresTotal.labels('browser_launch', 'start').inc();
@@ -6516,7 +6661,7 @@ app.post('/stop', async (req, res) => {
       return res.status(403).json({ error: 'Forbidden' });
     }
     await closeAllSessions('admin_stop', { clearDownloads: true, clearLocks: true });
-    await closeBrowserFully('admin_stop');
+    await closeAllBrowsers('admin_stop');
     res.json({ ok: true, stopped: true, profile: 'camoufox' });
   } catch (err) {
     res.status(500).json({ ok: false, error: safeError(err) });
@@ -7028,13 +7173,17 @@ setInterval(() => {
     rssBytes: mem.rss,
     heapUsedBytes: mem.heapUsed,
     uptimeSeconds: Math.floor(process.uptime()),
-    browserConnected: browser?.isConnected() ?? false,
+    browserConnected: Object.values(browserStatus()).some(Boolean),
   });
 }, 5 * 60_000);
 
 // Active health probe -- detect hung browser even when isConnected() lies
 setInterval(async () => {
-  if (!browser || healthState.isRecovering) return;
+  const probed = [
+    ...(browser ? [{ name: BUILTIN_BROWSER, browser }] : []),
+    ...providerBrowsers.running(),
+  ];
+  if (probed.length === 0 || healthState.isRecovering) return;
   const timeSinceSuccess = Date.now() - healthState.lastSuccessfulNav;
   // Skip probe if operations are in flight AND last success was recent.
   // If it's been >120s since any successful operation, probe anyway --
@@ -7051,11 +7200,15 @@ setInterval(async () => {
   
   let testContext;
   try {
-    testContext = await browser.newContext({ viewport: null });
-    const page = await testContext.newPage();
-    await page.goto('about:blank', { timeout: 5000 });
-    await page.close();
-    await testContext.close();
+    // Every running browser: a hung one restarts them all (restartBrowser).
+    for (const { browser: probeBrowser } of probed) {
+      testContext = await probeBrowser.newContext({ viewport: null });
+      const page = await testContext.newPage();
+      await page.goto('about:blank', { timeout: 5000 });
+      await page.close();
+      await testContext.close();
+      testContext = null;
+    }
     healthState.lastSuccessfulNav = Date.now();
   } catch (err) {
     failuresTotal.labels('health_probe', 'internal').inc();
@@ -7080,12 +7233,12 @@ process.on('unhandledRejection', (reason) => {
   }
 });
 
-// Graceful shutdown
-let shuttingDown = false;
+// Graceful shutdown (shuttingDown is declared with the browser state above)
 
 async function gracefulShutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
+  const shutdownStartedAt = Date.now();
   log('info', 'shutting down', { signal });
 
   // Arm the watchdog and stop accepting new connections before anything
@@ -7110,7 +7263,8 @@ async function gracefulShutdown(signal) {
     clearLocks: false,
   });
 
-  await closeBrowserFully(`shutdown:${signal}`);
+  // Every browser in parallel, each within what is left of the force-exit budget (1 s kept for the flush).
+  await closeAllBrowsers(`shutdown:${signal}`, { deadline: shutdownStartedAt + 9000 });
   await sentryFlush(2000);
   process.exit(0);
 }
@@ -7133,7 +7287,8 @@ const pluginCtx = {
   log,
   events: pluginEvents,
   auth: authMiddleware,
-  ensureBrowser,
+  /** The warm browser (CAMOFOX_BROWSER unless a browser:warming listener names another), launched if needed. */
+  ensureBrowser: () => ensureWarmBrowser('plugin'),
   getSession,
   destroySession,
   closeSession,
@@ -7150,6 +7305,8 @@ const pluginCtx = {
   metricsRegistry: getRegister,
   createMetric,
   registerVirtualDisplayProvider: (pluginName, factory) => virtualDisplayRegistry.register(pluginName, factory),
+  /** Supply a browser other than the built-in Camoufox (lib/browser-providers.js); per plugin: registerBrowserProvider(provider). */
+  registerBrowserProvider: (pluginName, provider) => browserProviders.register(pluginName, provider),
   /** The VirtualDisplay class (camoufox-js, with safe display selection) -- plugins can subclass it. */
   VirtualDisplay: SafeVirtualDisplay,
   /** Answer a route as a blocked navigation (lib/navigation-block.js); the API caller gets the block. */
@@ -7161,6 +7318,12 @@ const pluginCtx = {
 let loadedPlugins;
 try {
   loadedPlugins = await loadPlugins(app, pluginCtx);
+  if (!browserProviders.has(CONFIG.browser)) {
+    throw Object.assign(
+      new Error(`CAMOFOX_BROWSER names an unknown browser: ${CONFIG.browser} (known: ${browserProviders.names().join(', ')})`),
+      { code: 'browser_unknown' },
+    );
+  }
 } catch (err) {
   log('error', 'plugin startup failed', {
     code: err?.code,
@@ -7225,8 +7388,9 @@ const server = app.listen(PORT, CONFIG.bindHost || undefined, async () => {
   // Pre-warm browser so first request doesn't eat a 6-7s cold start
   try {
     const start = Date.now();
-    await ensureBrowser();
-    log('info', 'browser pre-warmed', { ms: Date.now() - start });
+    const warmed = await resolveWarmBrowser('startup');
+    await ensureBrowserFor(warmed);
+    log('info', 'browser pre-warmed', { browser: warmed, ms: Date.now() - start });
     scheduleBrowserIdleShutdown();
   } catch (err) {
     if (isFatalInstallError(err)) {

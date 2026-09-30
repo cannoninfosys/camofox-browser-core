@@ -97,6 +97,25 @@ export async function register(app, ctx, pluginConfig = {}) {
     events,
   });
 
+  // --- Several browsers (browser providers): show the one in use ---
+  // Each browser has its own display; the watcher shows the display of the browser whose
+  // session was used last (else the newest).
+  const displays = new Map(); // provider -> ":N"
+  const follow = (userId) => {
+    try {
+      const browser = sessions?.get?.(String(userId))?.browser || 'camoufox';
+      const display = displays.get(browser);
+      if (display) watcher.setTarget?.(display);
+    } catch { /* never break the session */ }
+  };
+  events.on('browser:launched', ({ display, provider }) => {
+    if (display) displays.set(provider || 'camoufox', display);
+  });
+  events.on('browser:closed', ({ provider }) => { displays.delete(provider || 'camoufox'); });
+  for (const event of ['session:created', 'tab:created', 'tab:navigated']) {
+    events.on(event, ({ userId }) => follow(userId));
+  }
+
   // Clean up watcher on server shutdown
   events.on('server:shutdown', () => {
     if (watcher.exitCode === null) {

@@ -2,6 +2,31 @@
 # Pure helpers for vnc-watcher.sh. Kept separate so display ownership and
 # lifecycle decisions can be tested without starting Xvfb, x11vnc, or Docker.
 
+# Every Xvfb child of the server at the resolution, oldest first (pid order).
+list_owned_xvfb_pids() {
+  parent_pid="$1"
+  resolution="$2"
+  awk -v parent="$parent_pid" -v res="$resolution" '
+    $2 == parent && $3 ~ /(^|\/)Xvfb$/ && index($0, res) { print $1 }
+  '
+}
+
+# The display to show among the owned ones (one ":N" per line, oldest first):
+# the preferred display when it is one of them, else the newest.
+choose_display() {
+  preferred="$1"
+  last=""
+  while IFS= read -r display; do
+    [ -n "$display" ] || continue
+    if [ -n "$preferred" ] && [ "$display" = "$preferred" ]; then
+      printf '%s\n' "$display"
+      return 0
+    fi
+    last="$display"
+  done
+  [ -z "$last" ] || printf '%s\n' "$last"
+}
+
 find_owned_xvfb_pid() {
   parent_pid="$1"
   resolution="$2"

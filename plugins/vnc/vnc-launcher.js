@@ -43,7 +43,7 @@ export function resolveVncConfig(pluginConfig = {}, env = process.env) {
   return { enabled, resolution, vncPassword, viewOnly, vncPort, novncPort };
 }
 
-export function buildWatcherEnv({ resolution, vncPassword, viewOnly, vncPort, novncPort, statusFile }, env = process.env) {
+export function buildWatcherEnv({ resolution, vncPassword, viewOnly, vncPort, novncPort, statusFile, targetFile }, env = process.env) {
   return compactEnv({
     PATH: env.PATH,
     HOME: env.HOME,
@@ -54,6 +54,7 @@ export function buildWatcherEnv({ resolution, vncPassword, viewOnly, vncPort, no
     VNC_PORT: vncPort,
     NOVNC_PORT: novncPort,
     VNC_STATUS_FILE: statusFile,
+    VNC_TARGET_FILE: targetFile,
   });
 }
 
@@ -65,8 +66,9 @@ export function startWatcher({ resolution, vncPassword, viewOnly, vncPort, novnc
   const watcherPath = path.join(__dirname, 'vnc-watcher.sh');
   const statusDir = fs.mkdtempSync(path.join(os.tmpdir(), 'camofox-vnc-'));
   const statusFile = path.join(statusDir, 'status');
+  const targetFile = path.join(statusDir, 'target');
   const watcher = spawn('sh', [watcherPath], {
-    env: buildWatcherEnv({ resolution, vncPassword, viewOnly, vncPort, novncPort, statusFile }),
+    env: buildWatcherEnv({ resolution, vncPassword, viewOnly, vncPort, novncPort, statusFile, targetFile }),
     stdio: ['ignore', 'inherit', 'inherit'],
     detached: false,
   });
@@ -88,6 +90,16 @@ export function startWatcher({ resolution, vncPassword, viewOnly, vncPort, novnc
     } catch {
       return { running: false };
     }
+  };
+
+  /** The display to show when the server runs several (":N"; null = the newest). */
+  watcher.setTarget = (display) => {
+    try {
+      if (!display) { fs.rmSync(targetFile, { force: true }); return; }
+      const tmp = `${targetFile}.tmp`;
+      fs.writeFileSync(tmp, `${display}\n`);
+      fs.renameSync(tmp, targetFile);
+    } catch { /* the watcher is gone */ }
   };
 
   log('info', 'vnc watcher started', { pid: watcher.pid });

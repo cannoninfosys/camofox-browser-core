@@ -233,7 +233,15 @@
                       "type": "boolean"
                     },
                     "browserRunning": {
-                      "type": "boolean"
+                      "type": "boolean",
+                      "description": "Whether any browser is running."
+                    },
+                    "browsers": {
+                      "type": "object",
+                      "description": "Each browser (the built-in camoufox and plugin browser providers) and whether it runs.",
+                      "additionalProperties": {
+                        "type": "boolean"
+                      }
                     },
                     "activeTabs": {
                       "type": "integer"

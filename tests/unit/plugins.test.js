@@ -348,6 +348,28 @@ export function register(app, ctx) {
       expect(error.cause?.message).toBe('register exploded');
     });
 
+    test('ctx.registerBrowserProvider records the registering plugin; a name conflict stops loading', async () => {
+      for (const name of ['first', 'second']) {
+        const dir = path.join(pluginsDir, name);
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(path.join(dir, 'index.js'), `
+export function register(app, ctx) {
+  ctx.registerBrowserProvider({ name: 'other', launch: async () => null });
+}
+`);
+      }
+      const { createBrowserProviderRegistry } = await import('../../lib/browser-providers.js');
+      const registry = createBrowserProviderRegistry();
+      const ctx = { ...makeCtx(), registerBrowserProvider: (pluginName, provider) => registry.register(pluginName, provider) };
+      const configPath = writeConfig({ first: {}, second: {} });
+
+      const error = await loadPlugins({ loaded: [] }, ctx, { pluginsDir, configPath }).catch((err) => err);
+
+      expect(registry.get('other').pluginName).toBe('first');
+      expect(error).toMatchObject({ code: 'browser_provider_conflict' });
+      expect(error.message).toContain('"first"');
+    });
+
     test('a non-required plugin that throws in register is only logged', async () => {
       recordingPlugin(pluginsDir, 'alpha');
       throwingPlugin(pluginsDir, 'broken');

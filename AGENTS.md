@@ -441,7 +441,7 @@ await context.route('**/*', async (route) => {
 
 `fulfillBlockedNavigation` fulfills the route (status, `content-type`, `cache-control: no-store`, and the header `x-camofox-blocked: <code>`) and remembers the request; only responses answered through it count as blocks, so a website sending the same header is an ordinary page.
 
-Either way the API responds with the block's status and `{ "error": reason, "code": code, "retryable": <true when a recovery is given>, "recovery": recovery, "blocked": { "code": code, "reason": reason } }`. A blocked navigation is an answer, not a browser failure: it does not count toward the consecutive navigation failures that recover a session, and it never rotates a proxy.
+Either way the API responds with the block's status and `{ "error": reason (shown even when `NODE_ENV=production` hides internal error texts), "code": code, "retryable": <true when a recovery is given>, "recovery": recovery, "blocked": { "code": code, "reason": reason } }`. A blocked navigation is an answer, not a browser failure: it does not count toward the consecutive navigation failures that recover a session, and it never rotates a proxy.
 
 ### Virtual display
 

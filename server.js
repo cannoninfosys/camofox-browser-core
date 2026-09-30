@@ -296,7 +296,8 @@ function sendError(res, err, extraFields = {}) {
   const code = browserErrorCode(err);
   const recovery = browserErrorRecovery(err);
   const body = {
-    error: safeError(err),
+    // A navigation block's reason is written for the API caller by a plugin: shown in every environment.
+    error: isNavigationBlockedError(err) ? err.message : safeError(err),
     retryable: isRetryableBrowserError(err),
     ...extraFields,
   };

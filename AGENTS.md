@@ -306,7 +306,7 @@ export function register(app, ctx) {
 | `sessions` | `Map` | Live sessions: `userId -> { context, browser, tabGroups, lastAccess }` (`browser`: the browser the session runs on) |
 | `config` | `object` | Server CONFIG (port, apiKey, nodeEnv, proxy, etc.) |
 | `log` | `function` | `log(level, msg, fields)` -- structured JSON logging |
-| `events` | `EventEmitter` | Plugin event bus (29 events -- see below) |
+| `events` | `EventEmitter` | Plugin event bus (32 events -- see below) |
 | `auth` | `function` | `auth()` returns Express middleware enforcing API key / loopback |
 | `ensureBrowser` | `async function` | Launch the default browser (`CAMOFOX_BROWSER`) if not running, return it |
 | `getSession` | `async function` | `getSession(userId)` -- get or create a session |
@@ -324,15 +324,16 @@ export function register(app, ctx) {
 | `registerBrowserProvider` | `function` | `registerBrowserProvider({ name, launch(env), close?(browser, info) })` -- supply a browser other than the built-in Camoufox (see "Browser providers") |
 | `fulfillBlockedNavigation` | `async function` | `fulfillBlockedNavigation(route, { status, code, reason, recovery, contentType, body })` -- answer a route as a blocked navigation (see "Refusing or blocking navigations") |
 
-### Events (30)
+### Events (32)
 
-29 emitted by core, 1 (`session:storage:export`) emitted by plugins.
+31 emitted by core, 1 (`session:storage:export`) emitted by plugins.
 
 #### Browser Lifecycle
 | Event | Payload | Mutating? |
 |-------|---------|-----------|
 | `browser:launching` | `{ options, provider }` | (ok) Modify launch options in-place |
 | `browser:launched` | `{ browser, display, provider }` | |
+| `browser:warming` | `{ browser, reason }` | (ok) Set `browser` to the browser to keep warm (see "Browser providers") |
 | `browser:restart` | `{ reason }` | |
 | `browser:closed` | `{ reason, provider }` | |
 | `browser:error` | `{ error }` | |
@@ -340,6 +341,7 @@ export function register(app, ctx) {
 #### Session Lifecycle
 | Event | Payload | Mutating? |
 |-------|---------|-----------|
+| `session:resolving` | `{ userId, browser }` | (ok) Set `browser` to the browser this user's session runs on (see "Browser providers") |
 | `session:creating` | `{ userId, contextOptions, provider }` | (ok) Modify context options in-place |
 | `session:created` | `{ userId, context, provider }` | |
 | `session:destroyed` | `{ userId, reason }` | |
@@ -392,7 +394,7 @@ export function register(app, ctx) {
 
 ### Mutating Hooks
 
-`browser:launching`, `session:creating`, `session:created`, `session:destroyed`, and `tab:navigating` are emitted via `events.emitAsync()` -- the server awaits all listeners (including async ones) before proceeding. This ensures async work like loading storage state from disk completes before the context is created.
+`browser:launching`, `browser:warming`, `session:resolving`, `session:creating`, `session:created`, `session:destroyed`, and `tab:navigating` are emitted via `events.emitAsync()` -- the server awaits all listeners (including async ones) before proceeding. This ensures async work like loading storage state from disk completes before the context is created.
 
 `emitAsync()` runs listeners one after another, in the order they were added (plugin order, see `order` below), so a later plugin's change to the payload wins even when an earlier listener awaits before mutating. Every listener runs; if any throws, the first error is rethrown after the last one finishes.
 
@@ -471,6 +473,16 @@ ctx.registerBrowserProvider({
 - Displays created with `env.createVirtualDisplay()`, the returned `pid` and `ownedPids()` belong to the provider: the built-in browser's cleanup of its own survivors never kills them. The provider stops what it started (e.g. kills its display) in `close`.
 - `/health` reports `browsers` (`{ camoufox: bool, <provider>: bool }`); `browserRunning` is true when any browser runs; the "unexpected stop" 503 applies to the default browser. The health probe tests every running browser.
 - A provider's name registered twice stops startup (`browser_provider_conflict`).
+
+**Choosing the browser per session.** Before every session lookup (`getSession`: new tabs, `/tabs/open`, ...), the core awaits `session:resolving { userId, browser }` with `browser` = the default; a listener sets another browser name for that user. An unknown name answers 500 `browser_unknown`. A user's open session never moves: if it runs on another browser the request answers **409 `browser_mismatch`** (close the session first). A listener may also throw `{ statusCode, code }` to answer with its own error. Each browser idles out on its own when none of its sessions is left, and a browser that disconnects closes only its own sessions.
+
+**Choosing the warm browser.** The browser pre-warmed at startup (and relaunched by the warm retry, after a health-probe restart, by `/start` and `ctx.ensureBrowser`) is the default unless a `browser:warming { browser, reason }` listener names another (`reason`: `startup`, `retry`, `restart`, `start`, `plugin`); for example an instance that serves a single user can warm that user's browser. An unknown name or a failing listener keeps the default warm.
+
+```javascript
+ctx.events.on('session:resolving', (req) => {
+  if (req.userId.startsWith('stealth-')) req.browser = 'camoufox';
+});
+```
 
 ### System Packages (`apt.txt`) and Post-Install Hooks
 

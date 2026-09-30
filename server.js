@@ -84,7 +84,7 @@ function _countTabs() {
   return total;
 }
 function _browserPid() {
-  try { return browser?.process?.()?.pid ?? providerBrowsers.pid(CONFIG.browser) ?? null; } catch { return null; }
+  try { return browser?.process?.()?.pid ?? providerBrowsers.pid(warmBrowserName) ?? null; } catch { return null; }
 }
 function _resourceOpts() {
   return { sessionCount: sessions.size, tabCount: _countTabs(), browserPid: _browserPid() };
@@ -711,7 +711,8 @@ const INTENTIONAL_STOP_REASONS = new Set(['idle_shutdown', 'admin_stop']);
 // --- Browser providers (lib/browser-providers.js) ---
 // The built-in Camoufox keeps the `browser` singleton; a plugin-provided browser is managed by
 // providerBrowsers: launched on first use, idled out without sessions, closed on stop and shutdown.
-// CONFIG.browser (CAMOFOX_BROWSER) is the default browser: pre-warmed and used by sessions.
+// CONFIG.browser (CAMOFOX_BROWSER) is the default browser. A plugin may choose another one per session
+// (session:resolving) and the one to keep warm (browser:warming).
 const browserProviders = createBrowserProviderRegistry();
 let shuttingDown = false;
 
@@ -747,9 +748,30 @@ async function ensureBrowserFor(name) {
   return providerBrowsers.ensure(name);
 }
 
-/** The default browser (CAMOFOX_BROWSER), launched if needed. */
-function ensureDefaultBrowser() {
-  return ensureBrowserFor(CONFIG.browser);
+// The browser kept warm: pre-warmed at startup, relaunched by the warm retry and after a restart,
+// launched by /start and ctx.ensureBrowser. The default browser unless a browser:warming listener
+// names another (e.g. the browser of the one user an instance serves).
+let warmBrowserName = CONFIG.browser;
+
+async function resolveWarmBrowser(reason) {
+  const warming = { browser: CONFIG.browser, reason };
+  try {
+    await pluginEvents.emitAsync('browser:warming', warming);
+  } catch (err) {
+    log('warn', 'browser:warming listener failed; keeping the default browser warm', { error: err.message });
+    warming.browser = CONFIG.browser;
+  }
+  if (!browserProviders.has(warming.browser)) {
+    log('warn', 'browser:warming named an unknown browser; keeping the default browser warm', { browser: warming.browser });
+    warming.browser = CONFIG.browser;
+  }
+  warmBrowserName = warming.browser;
+  return warmBrowserName;
+}
+
+/** The warm browser, launched if needed. */
+async function ensureWarmBrowser(reason = 'plugin') {
+  return ensureBrowserFor(await resolveWarmBrowser(reason));
 }
 
 function isBuiltinRunning() {
@@ -765,16 +787,16 @@ function browserStatus() {
   return status;
 }
 
-function isDefaultBrowserRunning() {
-  return CONFIG.browser === BUILTIN_BROWSER ? isBuiltinRunning() : providerBrowsers.isRunning(CONFIG.browser);
+function isWarmBrowserRunning() {
+  return warmBrowserName === BUILTIN_BROWSER ? isBuiltinRunning() : providerBrowsers.isRunning(warmBrowserName);
 }
 
-function isDefaultBrowserLaunching() {
-  return CONFIG.browser === BUILTIN_BROWSER ? !!browserLaunchPromise : providerBrowsers.isLaunching(CONFIG.browser);
+function isWarmBrowserLaunching() {
+  return warmBrowserName === BUILTIN_BROWSER ? !!browserLaunchPromise : providerBrowsers.isLaunching(warmBrowserName);
 }
 
-function defaultBrowserStopReason() {
-  return CONFIG.browser === BUILTIN_BROWSER ? _lastBrowserStopReason : providerBrowsers.lastStopReason(CONFIG.browser);
+function warmBrowserStopReason() {
+  return warmBrowserName === BUILTIN_BROWSER ? _lastBrowserStopReason : providerBrowsers.lastStopReason(warmBrowserName);
 }
 
 /**
@@ -830,12 +852,12 @@ function camoufoxInstallRemediation() {
 }
 
 function scheduleBrowserWarmRetry(delayMs = 5000) {
-  if (browserWarmRetryTimer || isDefaultBrowserRunning() || isDefaultBrowserLaunching()) return;
+  if (browserWarmRetryTimer || isWarmBrowserRunning() || isWarmBrowserLaunching()) return;
   browserWarmRetryTimer = setTimeout(async () => {
     browserWarmRetryTimer = null;
     try {
       const start = Date.now();
-      await ensureDefaultBrowser();
+      await ensureWarmBrowser('retry');
       log('info', 'background browser warm retry succeeded', { ms: Date.now() - start });
     } catch (err) {
       if (isFatalInstallError(err)) {
@@ -914,12 +936,12 @@ async function restartBrowser(reason) {
   try {
     await closeAllSessions(`browser_restart:${reason}`, { clearDownloads: true, clearLocks: true });
     userNavHealth.clear();
-    // Every browser (each emits browser:closed), then the default one again.
+    // Every browser (each emits browser:closed), then the warm one again.
     await closeAllBrowsers(`browser_restart:${reason}`);
     // Do NOT clear browserLaunchPromise here — ensureBrowser() owns the
     // single-flight primitive. Clearing it manually opens a window where a
     // concurrent request can start a second launch. See #8554.
-    await ensureDefaultBrowser();
+    await ensureWarmBrowser('restart');
     healthState.lastSuccessfulNav = Date.now();
     log('info', 'browser restarted successfully');
   } catch (err) {
@@ -1455,7 +1477,17 @@ async function getSession(userId, { trace = false } = {}) {
       }
     }
   }
-  
+
+  // Which browser this user's session runs on: the default, unless a session:resolving listener
+  // names another. Asked on every call; an open session never moves to another browser (409).
+  const resolving = { userId: key, browser: CONFIG.browser };
+  await pluginEvents.emitAsync('session:resolving', resolving);
+  const browserName = resolving.browser;
+  if (!browserProviders.has(browserName)) {
+    throw Object.assign(new Error(`Unknown browser: ${browserName}`), { statusCode: 500, code: 'browser_unknown' });
+  }
+  if (session) assertSameBrowser(key, session, browserName);
+
   if (!session) {
     session = await coalesceInflight(sessionCreations, key, async () => {
       if (sessions.size >= MAX_SESSIONS) {
@@ -1481,7 +1513,6 @@ async function getSession(userId, { trace = false } = {}) {
           );
         }
       }
-      const browserName = CONFIG.browser;
       const b = await ensureBrowserFor(browserName);
       const contextOptions = {
         viewport: null,
@@ -1529,9 +1560,20 @@ async function getSession(userId, { trace = false } = {}) {
       });
       return created;
     });
+    assertSameBrowser(key, session, browserName); // a concurrent creation may have used another browser
   }
   session.lastAccess = Date.now();
   return session;
+}
+
+function assertSameBrowser(userId, session, wanted) {
+  const open = session.browser || BUILTIN_BROWSER;
+  if (open !== wanted) {
+    throw Object.assign(
+      new Error(`Session for userId "${userId}" is open on ${open}; close it before using ${wanted}`),
+      { statusCode: 409, code: 'browser_mismatch' },
+    );
+  }
 }
 
 async function createLeasedPage(session) {
@@ -2800,10 +2842,10 @@ app.get('/health', (req, res) => {
   const rssMb = Math.round(mem.rss / 1048576);
   const heapUsedMb = Math.round(mem.heapUsed / 1048576);
   const nativeMemMb = rssMb - heapUsedMb;
-  const stopReason = defaultBrowserStopReason();
+  const stopReason = warmBrowserStopReason();
 
-  // Default browser not running: distinguish intentional idle stop from unexpected death
-  if (!isDefaultBrowserRunning() && stopReason && !INTENTIONAL_STOP_REASONS.has(stopReason)) {
+  // Warm browser not running: distinguish intentional idle stop from unexpected death
+  if (!isWarmBrowserRunning() && stopReason && !INTENTIONAL_STOP_REASONS.has(stopReason)) {
     // Unexpected browser absence — schedule recovery and report unhealthy
     scheduleBrowserWarmRetry();
     return res.status(503).json({
@@ -6573,7 +6615,7 @@ app.post('/tabs/open', async (req, res) => {
  */
 app.post('/start', async (req, res) => {
   try {
-    await ensureDefaultBrowser();
+    await ensureWarmBrowser('start');
     res.json({ ok: true, profile: 'camoufox' });
   } catch (err) {
     failuresTotal.labels('browser_launch', 'start').inc();
@@ -7245,8 +7287,8 @@ const pluginCtx = {
   log,
   events: pluginEvents,
   auth: authMiddleware,
-  /** The default browser (CAMOFOX_BROWSER), launched if needed. */
-  ensureBrowser: ensureDefaultBrowser,
+  /** The warm browser (CAMOFOX_BROWSER unless a browser:warming listener names another), launched if needed. */
+  ensureBrowser: () => ensureWarmBrowser('plugin'),
   getSession,
   destroySession,
   closeSession,
@@ -7346,8 +7388,9 @@ const server = app.listen(PORT, CONFIG.bindHost || undefined, async () => {
   // Pre-warm browser so first request doesn't eat a 6-7s cold start
   try {
     const start = Date.now();
-    await ensureDefaultBrowser();
-    log('info', 'browser pre-warmed', { browser: CONFIG.browser, ms: Date.now() - start });
+    const warmed = await resolveWarmBrowser('startup');
+    await ensureBrowserFor(warmed);
+    log('info', 'browser pre-warmed', { browser: warmed, ms: Date.now() - start });
     scheduleBrowserIdleShutdown();
   } catch (err) {
     if (isFatalInstallError(err)) {

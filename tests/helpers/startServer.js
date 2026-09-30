@@ -54,18 +54,24 @@ async function startServer(port = 0, extraEnv = {}) {
 
 async function stopServer() {
   if (serverProcess) {
+    // Kill this very process: the fallback must never hit a server started after it.
+    const proc = serverProcess;
     return new Promise((resolve) => {
-      serverProcess.on('close', () => {
-        serverProcess = null;
-        serverPort = null;
+      let killTimer = null;
+      proc.on('close', () => {
+        clearTimeout(killTimer);
+        if (serverProcess === proc) {
+          serverProcess = null;
+          serverPort = null;
+        }
         resolve();
       });
 
-      serverProcess.kill('SIGTERM');
+      proc.kill('SIGTERM');
 
-      setTimeout(() => {
-        if (serverProcess) {
-          serverProcess.kill('SIGKILL');
+      killTimer = setTimeout(() => {
+        if (proc.exitCode === null && proc.signalCode === null) {
+          proc.kill('SIGKILL');
         }
       }, 5000);
     });

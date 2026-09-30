@@ -27,6 +27,8 @@ describe('tab:navigating hook and navigation blocks', () => {
     await new Promise((resolve) => site.listen(0, '127.0.0.1', resolve));
     siteUrl = `http://127.0.0.1:${site.address().port}`;
     await startServer(0, {
+      // Production: error texts are hidden there, except a block's reason (written for the caller).
+      NODE_ENV: 'production',
       CAMOFOX_PLUGIN_PATH: FIXTURES,
       CAMOFOX_CONFIG: path.join(FIXTURES, 'camofox.config.json'),
     });
